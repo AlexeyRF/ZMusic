@@ -1,0 +1,117 @@
+        floatingActionButton = {
+            FloatingActionButton(onClick = {
+                filePickerLauncher.launch("audio/*")
+            }) {
+                Icon(Icons.Filled.Add, contentDescription = "Add")
+            }
+        },
+        bottomBar = {
+            val trackName = AudioPlayer.currentTrackName.value
+            if (trackName != null) {
+                HorizontalDivider()
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = trackName,
+                            style = MaterialTheme.typography.bodyLarge,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f).padding(bottom = 0.dp)
+                        )
+                        var showEffects by remember { mutableStateOf(false) }
+                        Box {
+                            TextButton(onClick = { showEffects = true }) {
+                                Text(AudioPlayer.activeEffect.value.title)
+                            }
+                            DropdownMenu(expanded = showEffects, onDismissRequest = { showEffects = false }) {
+                                AudioEffectType.values().forEach { effect ->
+                                    DropdownMenuItem(
+                                        text = { Text(effect.title) },
+                                        onClick = { AudioPlayer.applyEffect(effect); showEffects = false }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    fun formatTimeMs(ms: Int): String {
+                        val totalSeconds = ms / 1000
+                        val m = totalSeconds / 60
+                        val s = totalSeconds % 60
+                        return String.format("%02d:%02d", m, s)
+                    }
+                    
+                    Slider(
+                        value = AudioPlayer.currentPosition.value.toFloat(),
+                        onValueChange = { AudioPlayer.seekTo(it.toInt()) },
+                        valueRange = 0f..(AudioPlayer.duration.value.coerceAtLeast(1)).toFloat(),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 0.dp)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(text = formatTimeMs(AudioPlayer.currentPosition.value), style = MaterialTheme.typography.bodySmall)
+                        Text(text = formatTimeMs(AudioPlayer.duration.value), style = MaterialTheme.typography.bodySmall)
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { 
+                            AudioPlayer.isShuffle.value = !AudioPlayer.isShuffle.value
+                            AudioPlayer.updateService(context)
+                        }) {
+                            Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle", tint = if (AudioPlayer.isShuffle.value) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                        }
+                        IconButton(onClick = { AudioPlayer.prev() }) {
+                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Prev")
+                        }
+                        IconButton(onClick = { 
+                            if (AudioPlayer.isPlayingState.value) AudioPlayer.pause(context) else AudioPlayer.resume(context) 
+                        }) {
+                            Icon(if (AudioPlayer.isPlayingState.value) Icons.Filled.Pause else Icons.Filled.PlayArrow, contentDescription = "Play/Pause", modifier = Modifier.size(32.dp))
+                        }
+                        IconButton(onClick = { AudioPlayer.next() }) {
+                            Icon(Icons.Filled.SkipNext, contentDescription = "Next")
+                        }
+                        IconButton(onClick = { 
+                            AudioPlayer.isRepeat.value = !AudioPlayer.isRepeat.value 
+                            AudioPlayer.updateService(context)
+                        }) {
+                            Icon(Icons.Filled.Repeat, contentDescription = "Repeat", tint = if (AudioPlayer.isRepeat.value) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                        }
+                    }
+                }
+            }
+        }
+    ) { paddingValues ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                if (isLoading) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
+                    }
+                } else if (musicList.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("No Audio")
+                    }
+                } else {
+                    LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(musicList) { track ->
+                            MusicItem(track = track, onClick = {
+                                AudioPlayer.setPlaylist(context, maxClient, musicList, musicList.indexOf(track))
+                                AudioPlayer.playCurrentTrack()
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
