@@ -769,7 +769,8 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                     onValueChange = { phone = it },
                     label = { Text("Номер телефона") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.autofill(listOf(androidx.compose.ui.autofill.AutofillType.PhoneNumber), currentValue = phone) { phone = it }
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(
@@ -807,7 +808,8 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                     onValueChange = { code = it },
                     label = { Text("SMS код") },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.autofill(listOf(androidx.compose.ui.autofill.AutofillType.SmsOtpCode), currentValue = code) { code = it }
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(
@@ -865,11 +867,26 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                 Text("Двухфакторная аутентификация", style = MaterialTheme.typography.headlineMedium)
                 Spacer(modifier = Modifier.height(16.dp))
                 OutlinedTextField(
+                    value = phone,
+                    onValueChange = {},
+                    label = { Text("Номер телефона") },
+                    readOnly = true,
+                    singleLine = true,
+                    modifier = Modifier.autofill(listOf(androidx.compose.ui.autofill.AutofillType.Username), currentValue = phone) {}
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(
                     value = password,
                     onValueChange = { password = it },
                     label = { Text("Пароль 2FA") },
                     visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true
+                    singleLine = true,
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Password),
+                    modifier = Modifier.autofill(
+                        autofillTypes = listOf(androidx.compose.ui.autofill.AutofillType.Password),
+                        currentValue = password,
+                        onFill = { password = it }
+                    )
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(
@@ -936,12 +953,26 @@ fun MusicListScreen(
                     Text("Для обеспечения безопасности ваших треков, придумайте или введите пароль для шифрования (сохраните его в Google Паролях или другом менеджере). Он будет использоваться локально.")
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
+                        value = "ZMusic Local",
+                        onValueChange = {},
+                        label = { Text("Аккаунт") },
+                        readOnly = true,
+                        singleLine = true,
+                        modifier = Modifier.autofill(listOf(androidx.compose.ui.autofill.AutofillType.Username), currentValue = "ZMusic Local") {}
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
                         value = pwd,
                         onValueChange = { pwd = it },
                         label = { Text("Пароль") },
                         singleLine = true,
                         visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        modifier = Modifier.autofill(
+                            autofillTypes = listOf(androidx.compose.ui.autofill.AutofillType.Password),
+                            currentValue = pwd,
+                            onFill = { pwd = it }
+                        )
                     )
                 }
             },
@@ -1222,19 +1253,25 @@ fun MusicListScreen(
                 .padding(paddingValues)
         ) {
             Box(modifier = Modifier.weight(1f)) {
+                val displayList = if (AudioPlayer.isCachedOnly.value) {
+                    musicList.filter { java.io.File(context.cacheDir, "track_${it.fileId}.audio").exists() }
+                } else {
+                    musicList
+                }
+                
                 if (isLoading) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
                     }
-                } else if (musicList.isEmpty()) {
+                } else if (displayList.isEmpty()) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Нет аудио")
+                        Text(if (AudioPlayer.isCachedOnly.value) "Нет закешированных аудио" else "Нет аудио")
                     }
                 } else {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(musicList) { track ->
+                        items(displayList) { track ->
                             MusicItem(track = track, onClick = {
-                                AudioPlayer.setPlaylist(context, maxClient, musicList, musicList.indexOf(track))
+                                AudioPlayer.setPlaylist(context, maxClient, displayList, displayList.indexOf(track))
                                 AudioPlayer.playCurrentTrack()
                             })
                         }
@@ -1386,6 +1423,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
                 }
                 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+
                 Text("Логи приложения", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
             }
             items(Logger.logs) { log ->
