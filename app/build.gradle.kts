@@ -56,4 +56,7 @@ dependencies {
     
     // For PyMax Protocol emulation
     implementation("org.msgpack:msgpack-core:0.9.8")
+    
+    // For editing audio metadata
+    implementation("net.jthink:jaudiotagger:3.0.1")
 }

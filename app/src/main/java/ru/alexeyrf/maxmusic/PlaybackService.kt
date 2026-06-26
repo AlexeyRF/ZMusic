@@ -51,7 +51,11 @@ class PlaybackService : Service() {
             override fun onCustomAction(action: String?, extras: android.os.Bundle?) {
                 when (action) {
                     ACTION_SHUFFLE -> {
-                        AudioPlayer.isShuffle.value = !AudioPlayer.isShuffle.value
+                        AudioPlayer.playMode.value = when (AudioPlayer.playMode.value) {
+                            AudioPlayer.PlayMode.SEQUENTIAL -> AudioPlayer.PlayMode.SHUFFLE
+                            AudioPlayer.PlayMode.SHUFFLE -> AudioPlayer.PlayMode.SIMILAR
+                            AudioPlayer.PlayMode.SIMILAR -> AudioPlayer.PlayMode.SEQUENTIAL
+                        }
                         AudioPlayer.updateService(this@PlaybackService)
                     }
                     ACTION_REPEAT -> {
@@ -61,7 +65,11 @@ class PlaybackService : Service() {
                 }
             }
             override fun onSetShuffleMode(shuffleMode: Int) {
-                AudioPlayer.isShuffle.value = !AudioPlayer.isShuffle.value
+                AudioPlayer.playMode.value = when (AudioPlayer.playMode.value) {
+                    AudioPlayer.PlayMode.SEQUENTIAL -> AudioPlayer.PlayMode.SHUFFLE
+                    AudioPlayer.PlayMode.SHUFFLE -> AudioPlayer.PlayMode.SIMILAR
+                    AudioPlayer.PlayMode.SIMILAR -> AudioPlayer.PlayMode.SEQUENTIAL
+                }
                 AudioPlayer.updateService(this@PlaybackService)
             }
             override fun onSetRepeatMode(repeatMode: Int) {
@@ -80,7 +88,11 @@ class PlaybackService : Service() {
             ACTION_NEXT -> AudioPlayer.next()
             ACTION_PREV -> AudioPlayer.prev()
             ACTION_SHUFFLE -> {
-                AudioPlayer.isShuffle.value = !AudioPlayer.isShuffle.value
+                AudioPlayer.playMode.value = when (AudioPlayer.playMode.value) {
+                    AudioPlayer.PlayMode.SEQUENTIAL -> AudioPlayer.PlayMode.SHUFFLE
+                    AudioPlayer.PlayMode.SHUFFLE -> AudioPlayer.PlayMode.SIMILAR
+                    AudioPlayer.PlayMode.SIMILAR -> AudioPlayer.PlayMode.SEQUENTIAL
+                }
             }
             ACTION_REPEAT -> {
                 AudioPlayer.isRepeat.value = !AudioPlayer.isRepeat.value
@@ -100,12 +112,12 @@ class PlaybackService : Service() {
     }
 
     private fun createNotification(trackName: String, isPlaying: Boolean): android.app.Notification {
-        mediaSession.setShuffleMode(if (AudioPlayer.isShuffle.value) PlaybackStateCompat.SHUFFLE_MODE_ALL else PlaybackStateCompat.SHUFFLE_MODE_NONE)
+        mediaSession.setShuffleMode(if (AudioPlayer.playMode.value != AudioPlayer.PlayMode.SEQUENTIAL) PlaybackStateCompat.SHUFFLE_MODE_ALL else PlaybackStateCompat.SHUFFLE_MODE_NONE)
         mediaSession.setRepeatMode(if (AudioPlayer.isRepeat.value) PlaybackStateCompat.REPEAT_MODE_ALL else PlaybackStateCompat.REPEAT_MODE_NONE)
         
         val stateBuilder = PlaybackStateCompat.Builder()
             .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_SKIP_TO_NEXT or PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or PlaybackStateCompat.ACTION_SEEK_TO or PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE or PlaybackStateCompat.ACTION_SET_REPEAT_MODE)
-            .addCustomAction(ACTION_SHUFFLE, "Shuffle", if (AudioPlayer.isShuffle.value) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle_off)
+            .addCustomAction(ACTION_SHUFFLE, "Shuffle", if (AudioPlayer.playMode.value != AudioPlayer.PlayMode.SEQUENTIAL) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle_off)
             .addCustomAction(ACTION_REPEAT, "Repeat", if (AudioPlayer.isRepeat.value) R.drawable.ic_repeat_on else R.drawable.ic_repeat_off)
             .setState(
                 if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
@@ -124,7 +136,7 @@ class PlaybackService : Service() {
         }
         mediaSession.setMetadata(metadataBuilder.build())
 
-        val shuffleIcon = if (AudioPlayer.isShuffle.value) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle_off
+        val shuffleIcon = if (AudioPlayer.playMode.value != AudioPlayer.PlayMode.SEQUENTIAL) R.drawable.ic_shuffle_on else R.drawable.ic_shuffle_off
         val shuffleAction = NotificationCompat.Action(
             shuffleIcon, "Перемешать",
             PendingIntent.getService(this, 3, Intent(this, PlaybackService::class.java).setAction(ACTION_SHUFFLE), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -163,7 +175,7 @@ class PlaybackService : Service() {
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(trackName)
-            .setContentText("MAXMusic")
+            .setContentText("ZMusic")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(pendingIntent)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)

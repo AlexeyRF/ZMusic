@@ -20,9 +20,11 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -40,7 +42,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import ru.alexeyrf.maxmusic.client.MaxClient
 import ru.alexeyrf.maxmusic.client.MusicMessage
-import ru.alexeyrf.maxmusic.ui.theme.MAXMusicTheme
+import ru.alexeyrf.maxmusic.ui.theme.ZMusicTheme
 
 import androidx.compose.ui.platform.LocalContext
 import android.content.Context
@@ -54,6 +56,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.ui.text.style.TextOverflow
 
 object AudioCacheManager {
     private const val PREFS_NAME = "audio_cache_prefs"
@@ -84,6 +93,20 @@ object AudioCacheManager {
                 )
             }
         } catch (e: Exception) { e.printStackTrace() }
+    }
+
+    fun getCachedTracks(): List<ru.alexeyrf.maxmusic.client.MusicMessage> {
+        val tracks = mutableListOf<ru.alexeyrf.maxmusic.client.MusicMessage>()
+        for ((k, _) in cacheMeta) {
+            tracks.add(ru.alexeyrf.maxmusic.client.MusicMessage(
+                messageId = 0, 
+                fileId = k, 
+                filename = "Cached Track $k", 
+                fileUrl = "", 
+                chatId = 0
+            ))
+        }
+        return tracks
     }
     
     fun setCacheLimit(context: Context, bytes: Long) {
@@ -118,7 +141,7 @@ object AudioCacheManager {
         return null
     }
 
-    suspend fun downloadTrack(context: Context, fileId: Long, urlStr: String): File? = withContext(Dispatchers.IO) {
+    suspend fun downloadTrack(context: Context, fileId: Long, urlStr: String, fileName: String): File? = withContext(Dispatchers.IO) {
         try {
             val file = File(context.cacheDir, "track_$fileId.audio")
             val url = URL(urlStr)
@@ -133,7 +156,17 @@ object AudioCacheManager {
             
             conn.inputStream.use { input ->
                 file.outputStream().use { output ->
-                    input.copyTo(output)
+                    if (fileName.endsWith(".zmusic") && CryptoManager.isPasswordSet) {
+                        try {
+                            CryptoManager.decryptStream(context, input, output)
+                        } catch (e: Exception) {
+                            Logger.log("Ошибка дешифровки: ${e.message}")
+                            // Fallback in case of wrong password or corruption
+                            input.copyTo(output)
+                        }
+                    } else {
+                        input.copyTo(output)
+                    }
                 }
             }
             
@@ -184,7 +217,8 @@ enum class AudioEffectType(val title: String) {
     SPEED_UP("Speed Up"),
     SLOWED("Slowed"),
     REVERB("Reverb"),
-    NIGHTCORE("Nightcore")
+    NIGHTCORE("Nightcore"),
+    SLOWED_REVERB("Slowed + Reverb")
 }
 
 object AudioPlayer {
@@ -202,7 +236,8 @@ object AudioPlayer {
     private var progressJob: kotlinx.coroutines.Job? = null
     
     val isRepeat = mutableStateOf(false)
-    val isShuffle = mutableStateOf(false)
+    enum class PlayMode { SEQUENTIAL, SHUFFLE, SIMILAR }
+    val playMode = mutableStateOf(PlayMode.SEQUENTIAL)
     val isCachedOnly = mutableStateOf(false)
     
     var playlist = listOf<ru.alexeyrf.maxmusic.client.MusicMessage>()
@@ -210,6 +245,21 @@ object AudioPlayer {
     
     var maxClient: ru.alexeyrf.maxmusic.client.MaxClient? = null
     var appContext: Context? = null
+
+    var currentTrackStartTime: Long = 0L
+    var currentTrackFileId: Long = -1L
+    var currentTrackFilePath: String? = null
+
+    fun recordVibeEvent() {
+        if (currentTrackFileId != -1L && currentTrackFilePath != null && currentTrackStartTime > 0) {
+            val listenMs = System.currentTimeMillis() - currentTrackStartTime
+            val totalMs = duration.value.toLong()
+            appContext?.let {
+                VibeManager.recordListenEvent(it, currentTrackFileId, activeEffect.value, java.io.File(currentTrackFilePath!!), listenMs, totalMs)
+            }
+        }
+        currentTrackStartTime = 0L
+    }
     
     fun setPlaylist(context: Context, client: ru.alexeyrf.maxmusic.client.MaxClient, list: List<ru.alexeyrf.maxmusic.client.MusicMessage>, startIndex: Int) {
         appContext = context.applicationContext
@@ -218,6 +268,14 @@ object AudioPlayer {
         currentTrackIndex = startIndex
     }
     
+    fun rebuildVibePlaylist(context: Context) {
+        if (VibeManager.isVibeModeEnabled.value) {
+            playlist = VibeManager.generateVibePlaylist(playlist)
+            currentTrackIndex = 0
+            playCurrentTrack()
+        }
+    }
+
     fun playCurrentTrack() {
         val track = playlist.getOrNull(currentTrackIndex) ?: return
         val context = appContext ?: return
@@ -229,16 +287,33 @@ object AudioPlayer {
                 if (file == null) {
                     val url = client.getFileDownloadUrl(track.messageId, track.fileId)
                     if (url != null) {
-                        file = AudioCacheManager.downloadTrack(context, track.fileId, url)
+                        file = AudioCacheManager.downloadTrack(context, track.fileId, url, track.filename)
                     }
                 }
                 
                 if (file != null) {
-                    playUrl(context, file.absolutePath, track.filename)
+                    currentTrackFileId = track.fileId
+                    currentTrackFilePath = file.absolutePath
+                    
+                    if (VibeManager.isVibeModeEnabled.value) {
+                        val predicted = VibeManager.predictedEffects[track.fileId]
+                        if (predicted != null) {
+                            activeEffect.value = predicted
+                        }
+                    }
+                    
+                    val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId)
+                    val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId)
+                    val fallbackName = if (!overrideTitle.isNullOrBlank()) {
+                        if (!overrideArtist.isNullOrBlank()) "$overrideArtist - $overrideTitle" else overrideTitle
+                    } else if (!track.serverTitle.isNullOrBlank()) {
+                        if (!track.serverArtist.isNullOrBlank()) "${track.serverArtist} - ${track.serverTitle}" else track.serverTitle
+                    } else track.filename.removePrefix("encrypted_").removeSuffix(".zmusic")
+                    playUrl(context, file.absolutePath, fallbackName, track.fileId)
                 }
                 
                 // Prefetch next track if sequential
-                if (!isShuffle.value && !isCachedOnly.value && playlist.size > 1) {
+                if (playMode.value == PlayMode.SEQUENTIAL && !isCachedOnly.value && playlist.size > 1) {
                     val nextIdx = (currentTrackIndex + 1) % playlist.size
                     val nextTrack = playlist[nextIdx]
                     CoroutineScope(Dispatchers.IO).launch {
@@ -246,7 +321,7 @@ object AudioPlayer {
                         if (!nextFile.exists()) {
                             val nextUrl = client.getFileDownloadUrl(nextTrack.messageId, nextTrack.fileId)
                             if (nextUrl != null) {
-                                AudioCacheManager.downloadTrack(context, nextTrack.fileId, nextUrl)
+                                AudioCacheManager.downloadTrack(context, nextTrack.fileId, nextUrl, nextTrack.filename)
                             }
                         }
                     }
@@ -270,8 +345,45 @@ object AudioPlayer {
         var attempts = 0
         
         do {
-            if (isShuffle.value) {
+            if (playMode.value == PlayMode.SHUFFLE) {
                 nextIndex = playlist.indices.random()
+            } else if (playMode.value == PlayMode.SIMILAR) {
+                // Find track with closest BPM
+                val currentFileId = playlist[currentTrackIndex].fileId
+                val currentEffect = activeEffect.value
+                val currentKey = "${currentFileId}_${currentEffect.name}"
+                
+                // Read TrackStats directly via reflection or SharedPreferences if needed.
+                // But wait, VibeManager stores TrackStats. Let's just pick random for now or use VibeManager.
+                // Wait, VibeManager.currentVibeTargetBpm? No, let's just pick one with closest BPM by calling analyzeTrackBpm or if it exists.
+                // To keep it simple, if in SIMILAR mode, we can just use the next track from VibeManager's generateVibePlaylist if we want, OR
+                // just pick a track from playlist that shares the artist for fallback, if BPM is too complex to get synchronously here.
+                // Wait, user said "Выбирать надо схожие по bpm". I must use BPM.
+                val context = appContext
+                if (context != null) {
+                    val currentFile = AudioCacheManager.getTrackFile(context, currentFileId)
+                    val targetBpm = if (currentFile != null) VibeManager.analyzeTrackBpm(currentFile, currentEffect) else 120f
+                    
+                    var bestMatchIdx = nextIndex
+                    var minBpmDiff = Float.MAX_VALUE
+                    
+                    for (i in playlist.indices) {
+                        if (i == currentTrackIndex) continue
+                        val file = AudioCacheManager.getTrackFile(context, playlist[i].fileId)
+                        if (file != null) {
+                            val bpm = VibeManager.analyzeTrackBpm(file, currentEffect)
+                            val diff = kotlin.math.abs(bpm - targetBpm)
+                            if (diff < minBpmDiff) {
+                                minBpmDiff = diff
+                                bestMatchIdx = i
+                            }
+                        }
+                    }
+                    if (bestMatchIdx == currentTrackIndex) bestMatchIdx = playlist.indices.random()
+                    nextIndex = bestMatchIdx
+                } else {
+                    nextIndex = playlist.indices.random()
+                }
             } else {
                 nextIndex = (nextIndex + 1) % playlist.size
             }
@@ -295,7 +407,7 @@ object AudioPlayer {
         var attempts = 0
         
         do {
-            if (isShuffle.value) {
+            if (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) {
                 nextIndex = playlist.indices.random()
             } else {
                 nextIndex = if (nextIndex - 1 < 0) playlist.size - 1 else nextIndex - 1
@@ -313,27 +425,53 @@ object AudioPlayer {
         playCurrentTrack()
     }
     
-    private fun extractAlbumArt(filePath: String): Bitmap? {
+    data class TrackMetadata(val title: String?, val artist: String?, val albumArt: Bitmap?)
+
+    fun extractTrackMetadata(filePath: String): TrackMetadata {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(filePath)
-            val art = retriever.embeddedPicture
-            if (art != null) {
-                return BitmapFactory.decodeByteArray(art, 0, art.size)
-            }
+            val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
+            val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
+            val artBytes = retriever.embeddedPicture
+            val art = if (artBytes != null) BitmapFactory.decodeByteArray(artBytes, 0, artBytes.size) else null
+            return TrackMetadata(title, artist, art)
         } catch (e: Exception) {
         } finally {
             retriever.release()
         }
-        return null
+        return TrackMetadata(null, null, null)
     }
     
-    fun playUrl(context: Context? = null, url: String, trackName: String) {
+    fun playUrl(context: Context? = null, url: String, trackName: String, fileId: Long = -1L) {
         try {
+            recordVibeEvent()
             mediaPlayer?.release()
-            currentTrackName.value = trackName
+            
+            var finalTrackName = trackName
+            if (url.startsWith("/")) {
+                val metadata = extractTrackMetadata(url)
+                currentAlbumArt.value = metadata.albumArt
+                if (metadata.title != null && !finalTrackName.contains(" - ")) { // Don't override if we already set a good fallback
+                    finalTrackName = if (metadata.artist != null) "${metadata.artist} - ${metadata.title}" else metadata.title
+                }
+            } else {
+                currentAlbumArt.value = null
+            }
+            
+            if (context != null && fileId != -1L) {
+                val overrideCover = LocalMetadataManager.getCover(context, fileId)
+                if (overrideCover != null) currentAlbumArt.value = overrideCover
+                
+                val overrideTitle = LocalMetadataManager.getTitle(context, fileId)
+                val overrideArtist = LocalMetadataManager.getArtist(context, fileId)
+                if (!overrideTitle.isNullOrBlank()) {
+                    finalTrackName = if (!overrideArtist.isNullOrBlank()) "$overrideArtist - $overrideTitle" else overrideTitle
+                }
+            }
+            
+            currentTrackName.value = finalTrackName
             isPlayingState.value = false
-            currentAlbumArt.value = if (url.startsWith("/")) extractAlbumArt(url) else null
             
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -345,11 +483,12 @@ object AudioPlayer {
                 setDataSource(url)
                 prepareAsync()
                 setOnPreparedListener { mp ->
-                    Logger.log("Началось воспроизведение: $trackName")
+                    Logger.log("Плеер готов к воспроизведению: $trackName")
                     applyEffect(activeEffect.value)
                     mp.start() 
                     isPlayingState.value = true
                     AudioPlayer.duration.value = mp.duration
+                    currentTrackStartTime = System.currentTimeMillis()
                     
                     progressJob?.cancel()
                     progressJob = CoroutineScope(Dispatchers.Main).launch {
@@ -456,6 +595,17 @@ object AudioPlayer {
                     mp.attachAuxEffect(reverb!!.id)
                     mp.setAuxEffectSendLevel(1.0f)
                 }
+                AudioEffectType.SLOWED_REVERB -> {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                        mp.playbackParams = mp.playbackParams.apply { speed = 0.8f; pitch = 0.8f }
+                    }
+                    reverb = PresetReverb(0, mp.audioSessionId).apply {
+                        preset = PresetReverb.PRESET_LARGEHALL
+                        enabled = true
+                    }
+                    mp.attachAuxEffect(reverb!!.id)
+                    mp.setAuxEffectSendLevel(1.0f)
+                }
                 AudioEffectType.NORMAL -> {}
             }
         } catch (e: Exception) {
@@ -507,10 +657,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CryptoManager.init(this)
         AudioCacheManager.init(this)
+        VibeManager.init(this)
         enableEdgeToEdge()
         setContent {
-            MAXMusicTheme {
+            ZMusicTheme {
                 var currentScreen by remember { mutableStateOf(Screen.Auth) }
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -527,11 +679,11 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.padding(innerPadding),
                                 maxClient = maxClient,
                                 onFileSelected = {},
-                                onShowLogs = { currentScreen = Screen.Logs }
+                                onShowSettings = { currentScreen = Screen.Settings }
                             )
                         }
-                        Screen.Logs -> {
-                            LogsScreen(
+                        Screen.Settings -> {
+                            SettingsScreen(
                                 modifier = Modifier.padding(innerPadding),
                                 onBack = { currentScreen = Screen.MusicList }
                             )
@@ -549,7 +701,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class Screen {
-    Auth, MusicList, Logs
+    Auth, MusicList, Settings
 }
 
 @Composable
@@ -726,15 +878,53 @@ fun MusicListScreen(
     modifier: Modifier = Modifier, 
     maxClient: MaxClient,
     onFileSelected: (Uri) -> Unit,
-    onShowLogs: () -> Unit
+    onShowSettings: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
     var musicList by remember { mutableStateOf<List<MusicMessage>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
-
     val context = androidx.compose.ui.platform.LocalContext.current
+    val prefs = context.getSharedPreferences("maxmusic_prefs", Context.MODE_PRIVATE)
+    var showPasswordDialog by remember { mutableStateOf(!CryptoManager.isPasswordSet) }
+
+    if (showPasswordDialog) {
+        var pwd by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { /* don't allow dismiss */ },
+            title = { Text(if (prefs.getString("auth_token", null) != null) "С обновлением ZMusic!" else "Добро пожаловать в ZMusic") },
+            text = {
+                Column {
+                    Text("Для обеспечения безопасности ваших треков, придумайте или введите пароль для шифрования (сохраните его в Google Паролях или другом менеджере). Он будет использоваться локально.")
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = pwd,
+                        onValueChange = { pwd = it },
+                        label = { Text("Пароль") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    if (pwd.isNotBlank()) {
+                        CryptoManager.setPassword(context, pwd)
+                        showPasswordDialog = false
+                    }
+                }) {
+                    Text("Сохранить")
+                }
+            }
+        )
+    }
+
     val contentResolver = context.contentResolver
     
+    var uploadFileUri by remember { mutableStateOf<Uri?>(null) }
+    var uploadFileName by remember { mutableStateOf("") }
+    var uploadFileBytes by remember { mutableStateOf<ByteArray?>(null) }
+
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -754,25 +944,97 @@ fun MusicListScreen(
                         }
                     }
                     
-                    try {
-                        val success = maxClient.sendMusic(fileName, bytes)
-                        if (success) {
-                            Logger.log("Успешно загружен трек: $fileName")
-                            kotlinx.coroutines.delay(1500)
-                            musicList = maxClient.getSavedMusic()
+                    val ext = fileName.substringAfterLast('.', "").lowercase()
+                    if (ext !in listOf("mp3", "flac", "wav", "m4a", "ogg", "aac", "zmusic")) {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            android.widget.Toast.makeText(context, "Поддерживаются только аудиофайлы и .zmusic", android.widget.Toast.LENGTH_SHORT).show()
                         }
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        Logger.log("Ошибка загрузки: ${e.message}")
+                        isLoading = false
+                        return@launch
+                    }
+                    
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                        uploadFileBytes = bytes
+                        uploadFileName = fileName
+                        uploadFileUri = uri
+                        isLoading = false
                     }
                 } catch (e: Exception) {
                     Logger.log("Сбой при загрузке: ${e.message}")
-                } finally {
                     isLoading = false
                 }
             }
         }
+    }
+
+    if (uploadFileUri != null && uploadFileBytes != null) {
+        val ext = uploadFileName.substringAfterLast('.', "")
+        val rawName = uploadFileName.removeSuffix(".$ext")
+        MetadataEditorDialog(
+            initialTitle = rawName,
+            initialArtist = "",
+            initialCover = null,
+            onDismiss = {
+                uploadFileUri = null
+                uploadFileBytes = null
+            },
+            onSave = { newTitle, newArtist, newCover ->
+                val bytesToUpload = uploadFileBytes!!
+                val fileNameToUpload = uploadFileName
+                
+                uploadFileUri = null
+                uploadFileBytes = null
+                isLoading = true
+                
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    try {
+                        var processedBytes = bytesToUpload
+                        var unencryptedBytes = bytesToUpload
+                        var finalFileName = fileNameToUpload
+                        
+                        val isZmusic = fileNameToUpload.endsWith(".zmusic")
+                        if (!isZmusic && (newTitle.isNotBlank() || newArtist.isNotBlank() || newCover != null)) {
+                            processedBytes = ID3Editor.embedMetadata(context, bytesToUpload, newTitle, newArtist, newCover, ext)
+                            val artistPrefix = if (newArtist.isNotBlank()) "$newArtist - " else ""
+                            val titlePart = if (newTitle.isNotBlank()) newTitle else rawName
+                            finalFileName = "$artistPrefix$titlePart.$ext"
+                            unencryptedBytes = processedBytes
+                        }
+                        
+                        if (CryptoManager.isPasswordSet && !isZmusic) {
+                            try {
+                                processedBytes = CryptoManager.encryptBytes(context, processedBytes)
+                                val extIndex = finalFileName.lastIndexOf('.')
+                                val name = if (extIndex != -1) finalFileName.substring(0, extIndex) else finalFileName
+                                val extt = if (extIndex != -1) finalFileName.substring(extIndex + 1) else ""
+                                finalFileName = "encrypted_${name}.${extt}.zmusic"
+                            } catch (e: Exception) {
+                                Logger.log("Ошибка шифрования: ${e.message}")
+                            }
+                        }
+                        
+                        val success = maxClient.sendMusic(finalFileName, processedBytes)
+                        if (success) {
+                            Logger.log("Успешно загружен трек: $finalFileName")
+                            kotlinx.coroutines.delay(1500)
+                            val newList = maxClient.getSavedMusic()
+                            val newTrack = newList.find { it.filename == finalFileName }
+                            if (newTrack != null) {
+                                val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
+                                cacheFile.writeBytes(unencryptedBytes)
+                            }
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                musicList = newList
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Logger.log("Ошибка загрузки: ${e.message}")
+                    } finally {
+                        isLoading = false
+                    }
+                }
+            }
+        )
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -800,40 +1062,23 @@ fun MusicListScreen(
             TopAppBar(
                 title = { Text("Музыка (Избранное)") },
                 actions = {
-                    var showMenu by remember { mutableStateOf(false) }
-                    IconButton(onClick = { showMenu = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Настройки")
+                    IconButton(onClick = {
+                        VibeManager.isVibeModeEnabled.value = !VibeManager.isVibeModeEnabled.value
+                        if (VibeManager.isVibeModeEnabled.value) {
+                            AudioPlayer.rebuildVibePlaylist(context)
+                        }
+                    }) {
+                        Icon(Icons.Filled.AutoAwesome, contentDescription = "Vibe Mode", tint = if (VibeManager.isVibeModeEnabled.value) MaterialTheme.colorScheme.primary else LocalContentColor.current)
                     }
-                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Логи приложения") },
-                            onClick = { onShowLogs(); showMenu = false }
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Лимит: 100 MB") },
-                            onClick = { AudioCacheManager.setCacheLimit(context, 100L * 1024 * 1024); showMenu = false }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Лимит: 500 MB") },
-                            onClick = { AudioCacheManager.setCacheLimit(context, 500L * 1024 * 1024); showMenu = false }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Лимит: 1 GB") },
-                            onClick = { AudioCacheManager.setCacheLimit(context, 1024L * 1024 * 1024); showMenu = false }
-                        )
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Только кэш: " + if (AudioPlayer.isCachedOnly.value) "Вкл" else "Выкл") },
-                            onClick = { AudioPlayer.isCachedOnly.value = !AudioPlayer.isCachedOnly.value; showMenu = false }
-                        )
+                    IconButton(onClick = onShowSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Настройки")
                     }
                 }
             )
         },
         floatingActionButton = {
             FloatingActionButton(onClick = {
-                filePickerLauncher.launch("audio/*")
+                filePickerLauncher.launch("*/*")
             }) {
                 Icon(Icons.Filled.Add, contentDescription = "Add")
             }
@@ -893,10 +1138,20 @@ fun MusicListScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = { 
-                            AudioPlayer.isShuffle.value = !AudioPlayer.isShuffle.value
+                            AudioPlayer.playMode.value = when (AudioPlayer.playMode.value) {
+                                AudioPlayer.PlayMode.SEQUENTIAL -> AudioPlayer.PlayMode.SHUFFLE
+                                AudioPlayer.PlayMode.SHUFFLE -> AudioPlayer.PlayMode.SIMILAR
+                                AudioPlayer.PlayMode.SIMILAR -> AudioPlayer.PlayMode.SEQUENTIAL
+                            }
                             AudioPlayer.updateService(context)
                         }) {
-                            Icon(Icons.Filled.Shuffle, contentDescription = "Shuffle", tint = if (AudioPlayer.isShuffle.value) MaterialTheme.colorScheme.primary else LocalContentColor.current)
+                            val icon = when (AudioPlayer.playMode.value) {
+                                AudioPlayer.PlayMode.SIMILAR -> Icons.Filled.AutoAwesome
+                                AudioPlayer.PlayMode.SHUFFLE -> Icons.Filled.Shuffle
+                                else -> Icons.Filled.Repeat
+                            }
+                            val tint = if (AudioPlayer.playMode.value != AudioPlayer.PlayMode.SEQUENTIAL) MaterialTheme.colorScheme.primary else LocalContentColor.current
+                            Icon(icon, contentDescription = "Play Mode", tint = tint)
                         }
                         IconButton(onClick = { AudioPlayer.prev() }) {
                             Icon(Icons.Filled.SkipPrevious, contentDescription = "Prev")
@@ -951,6 +1206,51 @@ fun MusicListScreen(
 
 @Composable
 fun MusicItem(track: MusicMessage, onClick: () -> Unit) {
+    val context = LocalContext.current
+    var title by remember { mutableStateOf(track.serverTitle ?: track.filename.removePrefix("encrypted_").removeSuffix(".zmusic")) }
+    var artist by remember { mutableStateOf<String?>(track.serverArtist) }
+    var albumArt by remember { mutableStateOf<Bitmap?>(null) }
+    
+    LaunchedEffect(track.fileId) {
+        withContext(Dispatchers.IO) {
+            val file = AudioCacheManager.getTrackFile(context, track.fileId)
+            if (file != null) {
+                val meta = AudioPlayer.extractTrackMetadata(file.absolutePath)
+                if (meta.title != null) title = meta.title
+                if (meta.artist != null) artist = meta.artist
+                if (meta.albumArt != null) albumArt = meta.albumArt
+            }
+            val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId)
+            if (overrideTitle != null) title = overrideTitle
+            val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId)
+            if (overrideArtist != null) artist = overrideArtist
+            val overrideCover = LocalMetadataManager.getCover(context, track.fileId)
+            if (overrideCover != null) albumArt = overrideCover
+        }
+    }
+
+    var showLocalEditor by remember { mutableStateOf(false) }
+    if (showLocalEditor) {
+        MetadataEditorDialog(
+            initialTitle = title,
+            initialArtist = artist ?: "",
+            initialCover = albumArt,
+            onDismiss = { showLocalEditor = false },
+            onSave = { newTitle, newArtist, newCover ->
+                showLocalEditor = false
+                title = newTitle
+                artist = newArtist.ifBlank { null }
+                if (newCover != null) albumArt = newCover
+                
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    LocalMetadataManager.saveTitle(context, track.fileId, newTitle)
+                    LocalMetadataManager.saveArtist(context, track.fileId, newArtist)
+                    LocalMetadataManager.saveCover(context, track.fileId, newCover)
+                }
+            }
+        )
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -964,16 +1264,47 @@ fun MusicItem(track: MusicMessage, onClick: () -> Unit) {
                 .padding(16.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.Filled.PlayArrow,
-                contentDescription = "Play",
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(40.dp)
-            )
+            if (albumArt != null) {
+                Image(
+                    bitmap = albumArt!!.asImageBitmap(),
+                    contentDescription = "Album Art",
+                    modifier = Modifier.size(40.dp).clip(RoundedCornerShape(4.dp)),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.MusicNote,
+                    contentDescription = "Music",
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(40.dp)
+                )
+            }
             Spacer(modifier = Modifier.width(16.dp))
-            Column {
-                Text(text = track.filename, style = MaterialTheme.typography.bodyLarge)
-                Text(text = "ID: ${track.fileId}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title, 
+                    style = MaterialTheme.typography.bodyLarge, 
+                    maxLines = 1, 
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (artist != null) {
+                    Text(
+                        text = artist!!, 
+                        style = MaterialTheme.typography.bodySmall, 
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                } else {
+                    Text(
+                        text = "ID: ${track.fileId}", 
+                        style = MaterialTheme.typography.bodySmall, 
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            IconButton(onClick = { showLocalEditor = true }) {
+                Icon(Icons.Filled.Edit, contentDescription = "Edit Metadata")
             }
         }
     }
@@ -981,10 +1312,11 @@ fun MusicItem(track: MusicMessage, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LogsScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
+fun SettingsScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     Column(modifier = modifier.fillMaxSize()) {
         TopAppBar(
-            title = { Text("Логи приложения") },
+            title = { Text("Настройки и данные") },
             navigationIcon = {
                 IconButton(onClick = onBack) {
                     Icon(Icons.Filled.ArrowBack, contentDescription = "Назад")
@@ -994,6 +1326,27 @@ fun LogsScreen(modifier: Modifier = Modifier, onBack: () -> Unit) {
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)
         ) {
+            item {
+                Text("Настройки кэша", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(vertical = 8.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Button(onClick = { AudioCacheManager.setCacheLimit(context, 100L * 1024 * 1024) }) { Text("100 MB") }
+                    Button(onClick = { AudioCacheManager.setCacheLimit(context, 500L * 1024 * 1024) }) { Text("500 MB") }
+                    Button(onClick = { AudioCacheManager.setCacheLimit(context, 1024L * 1024 * 1024) }) { Text("1 GB") }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Офлайн режим (только кэш)", modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = AudioPlayer.isCachedOnly.value,
+                        onCheckedChange = { AudioPlayer.isCachedOnly.value = it }
+                    )
+                }
+                
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                Text("Логи приложения", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(bottom = 8.dp))
+            }
             items(Logger.logs) { log ->
                 Text(text = log, style = MaterialTheme.typography.bodySmall)
                 HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))

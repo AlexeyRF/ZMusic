@@ -22,7 +22,9 @@ data class MusicMessage(
     val fileId: Long,
     val filename: String,
     val fileUrl: String = "",
-    val chatId: Int = 0
+    val chatId: Int = 0,
+    val serverTitle: String? = null,
+    val serverArtist: String? = null
 )
 
 /**
@@ -214,6 +216,8 @@ class MaxClient(
             }
         } catch (e: Exception) {
             Log.e(tag, "Send frame error", e)
+            disconnect()
+            throw e
         }
     }
 
@@ -309,56 +313,80 @@ class MaxClient(
     }
 
     // --- Работа с Музыкой ---
-    suspend fun getSavedMusic(): List<MusicMessage> {
-        // CHAT_HISTORY = 49 (запрашиваем историю чата 0)
-        val res = sendRequest(0, 49, mapOf(
-            "chatId" to 0, 
-            "backward" to 100,
-            "from" to System.currentTimeMillis(),
-            "itemType" to "REGULAR",
-            "getMessages" to true,
-            "interactive" to false
-        ))
-        
-        val messages = mutableListOf<MusicMessage>()
-        val msgsList = res["messages"] as? List<*> ?: return emptyList()
-        
-        for (msgObj in msgsList) {
-            val msg = msgObj as? Map<*, *> ?: continue
-            val msgId = (msg["id"] as? Number)?.toLong() ?: continue
-            
-            val attaches = msg["attaches"] as? List<*> ?: continue
-            for (attachObj in attaches) {
-                val attach = attachObj as? Map<*, *> ?: continue
-                val fileId = (attach["fileId"] as? Number)?.toLong()
-                
-                // Ищем имя файла по возможным ключам
-                val filename = attach["filename"] as? String 
-                    ?: attach["fileName"] as? String 
-                    ?: attach["name"] as? String
-                    ?: attach["title"] as? String
-                    ?: (attach["file"] as? Map<*, *>)?.get("name") as? String
-                    ?: (attach["file"] as? Map<*, *>)?.get("filename") as? String
-                    ?: "Unknown file"
-                    
-                val ext = filename.substringAfterLast('.', "").lowercase()
-                
-                if (fileId != null && ext in listOf("mp3", "flac", "wav")) {
-                    messages.add(MusicMessage(msgId, fileId, filename, "", 0))
+    suspend fun getSavedMusic(retryCount: Int = 1): List<MusicMessage> {
+        try {
+            if (!isConnected()) {
+                resumeSession()
+            }
+            // CHAT_HISTORY = 49 (чат 0)
+            val res = sendRequest(0, 49, mapOf(
+                "chatId" to 0,
+                "backward" to 100,
+                "from" to System.currentTimeMillis(),
+                "itemType" to "REGULAR",
+                "getMessages" to true,
+                "interactive" to false
+            ), timeoutMs = 15000L) // reduced timeout to fail faster on dead sockets
+
+            val messages = mutableListOf<MusicMessage>()
+            val msgsList = res["messages"] as? List<*> ?: return emptyList()
+
+            for (msgObj in msgsList) {
+                val msg = msgObj as? Map<*, *> ?: continue
+                val msgId = (msg["id"] as? Number)?.toLong() ?: continue
+
+                val attaches = msg["attaches"] as? List<*> ?: continue
+                for (attachObj in attaches) {
+                    val attach = attachObj as? Map<*, *> ?: continue
+                    val fileId = (attach["fileId"] as? Number)?.toLong()
+
+                    val filename = attach["filename"] as? String
+                        ?: attach["fileName"] as? String
+                        ?: attach["name"] as? String
+                        ?: attach["title"] as? String
+                        ?: (attach["file"] as? Map<*, *>)?.get("name") as? String
+                        ?: (attach["file"] as? Map<*, *>)?.get("filename") as? String
+                        ?: "Unknown file"
+
+                    val ext = filename.substringAfterLast('.', "").lowercase()
+
+                    val preview = attach["preview"] as? Map<*, *>
+                    val serverTitle = preview?.get("title") as? String
+                    val serverArtist = preview?.get("artist") as? String
+
+                    if (fileId != null && ext in listOf("mp3", "flac", "wav", "zmusic")) {
+                        messages.add(MusicMessage(msgId, fileId, filename, "", 0, serverTitle, serverArtist))
+                    }
                 }
             }
+            return messages
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to getSavedMusic, retryCount=$retryCount", e)
+            if (retryCount > 0) {
+                disconnect()
+                return getSavedMusic(retryCount - 1)
+            }
+            // If all retries fail, return cached tracks
+            return ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks()
         }
-        return messages
     }
     
     suspend fun getFileDownloadUrl(messageId: Long, fileId: Long): String? {
-        // FILE_DOWNLOAD = 88
-        val res = sendRequest(0, 88, mapOf(
-            "chatId" to 0,
-            "messageId" to messageId,
-            "fileId" to fileId
-        ))
-        return res["url"] as? String
+        return try {
+            if (!isConnected()) {
+                resumeSession()
+            }
+            // FILE_DOWNLOAD = 88
+            val res = sendRequest(0, 88, mapOf(
+                "chatId" to 0,
+                "messageId" to messageId,
+                "fileId" to fileId
+            ), timeoutMs = 10000L)
+            res["url"] as? String
+        } catch (e: Exception) {
+            Log.e(tag, "getFileDownloadUrl failed", e)
+            null
+        }
     }
 
     suspend fun sendMusic(fileName: String, fileBytes: ByteArray): Boolean = withContext(Dispatchers.IO) {
@@ -452,12 +480,20 @@ class MaxClient(
     }
 
     fun disconnect() {
-        readerScope.cancel()
         try {
+            pingJob?.cancel()
             socket?.close()
         } catch (e: Exception) {
-            e.printStackTrace()
+            // ignore
+        } finally {
+            socket = null
+            input = null
+            output = null
         }
+    }
+
+    fun isConnected(): Boolean {
+        return socket != null && socket?.isClosed == false
     }
 
     // ==========================================
