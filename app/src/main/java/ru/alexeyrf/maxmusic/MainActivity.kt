@@ -762,7 +762,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                 CircularProgressIndicator()
             }
             AuthStep.Phone -> {
-                Text("Вход в PyMax Music", style = MaterialTheme.typography.headlineMedium)
+                Text("Вход в ZMusic", style = MaterialTheme.typography.headlineMedium)
                 Spacer(modifier = Modifier.height(16.dp))
                 OutlinedTextField(
                     value = phone,
