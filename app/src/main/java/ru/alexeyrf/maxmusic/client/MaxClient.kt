@@ -258,8 +258,15 @@ class MaxClient(
         // AUTH_LOGIN_CHECK_PASSWORD = 115, in older versions 107. We use 115 per pymax.
         val res = sendRequest(0, 115, mapOf("trackId" to trackId, "password" to password))
         
-        if (res["loginToken"] != null) {
-            authToken = res["loginToken"] as String
+        val loginToken = res["loginToken"] as? String
+        val tokenAttrs = res["tokenAttrs"] as? Map<*, *>
+        val login = tokenAttrs?.get("LOGIN") as? Map<*, *>
+        val loginToken2 = login?.get("token") as? String
+        val fallbackToken = res["token"] as? String
+        
+        val finalToken = loginToken ?: loginToken2 ?: fallbackToken
+        if (finalToken != null) {
+            authToken = finalToken
             return doLogin()
         }
         return false

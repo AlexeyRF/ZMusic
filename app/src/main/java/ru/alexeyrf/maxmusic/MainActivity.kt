@@ -836,6 +836,30 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                 ) {
                     Text("Отправить")
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                TextButton(
+                    onClick = {
+                        isLoading = true
+                        Logger.log("Повторный запрос кода...")
+                        coroutineScope.launch {
+                            try {
+                                val success = maxClient.sendPhone(phone)
+                                if (success) {
+                                    Logger.log("Код отправлен повторно.")
+                                } else {
+                                    Logger.log("Ошибка: Сервер не принял повторный запрос.")
+                                }
+                            } catch (e: Exception) {
+                                Logger.log("Ошибка сети: ${e.message}")
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    },
+                    enabled = !isLoading
+                ) {
+                    Text("Запросить код повторно")
+                }
             }
             AuthStep.Password -> {
                 Text("Двухфакторная аутентификация", style = MaterialTheme.typography.headlineMedium)
