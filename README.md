@@ -19,4 +19,4 @@ ZMusic - это музыкальный плеер для Android. Оно поз�
 - Готово.
 
 ## Авторы и титры
-Автор [API]((https://github.com/MaxApiTeam/PyMax)) на Python (Pymax)
+Автор [API](https://github.com/MaxApiTeam/PyMax) на Python (Pymax)

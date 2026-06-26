@@ -11,15 +11,30 @@ import javax.crypto.CipherInputStream
 import javax.crypto.CipherOutputStream
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 
 object CryptoManager {
     private const val PREF_NAME = "crypto_prefs"
     private const val KEY_PASSWORD_HASH = "password_hash"
     var isPasswordSet = false
     private var secretKey: SecretKeySpec? = null
+
+    private fun getPrefs(context: Context): SharedPreferences {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        return EncryptedSharedPreferences.create(
+            context,
+            PREF_NAME,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    }
     
     fun init(context: Context) {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val prefs = getPrefs(context)
         val savedHash = prefs.getString(KEY_PASSWORD_HASH, null)
         isPasswordSet = savedHash != null
     }
@@ -29,14 +44,14 @@ object CryptoManager {
         val keyBytes = digest.digest(password.toByteArray(Charsets.UTF_8))
         secretKey = SecretKeySpec(keyBytes, "AES")
         
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val prefs = getPrefs(context)
         prefs.edit().putString(KEY_PASSWORD_HASH, Base64.encodeToString(keyBytes, Base64.DEFAULT)).apply()
         isPasswordSet = true
     }
 
     fun getSecretKey(context: Context): SecretKeySpec? {
         if (secretKey != null) return secretKey
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val prefs = getPrefs(context)
         val savedHash = prefs.getString(KEY_PASSWORD_HASH, null) ?: return null
         val keyBytes = Base64.decode(savedHash, Base64.DEFAULT)
         secretKey = SecretKeySpec(keyBytes, "AES")

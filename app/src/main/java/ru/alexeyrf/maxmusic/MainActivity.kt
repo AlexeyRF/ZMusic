@@ -63,7 +63,21 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 
+fun getEncryptedMaxmusicPrefs(context: Context): android.content.SharedPreferences {
+    val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+    return EncryptedSharedPreferences.create(
+        context,
+        "maxmusic_prefs",
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+}
 object AudioCacheManager {
     private const val PREFS_NAME = "audio_cache_prefs"
     var maxCacheSizeBytes: Long = 500L * 1024 * 1024 // 500 MB default
@@ -715,7 +729,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
     var isLoading by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
-    val prefs = context.getSharedPreferences("maxmusic_prefs", Context.MODE_PRIVATE)
+    val prefs = getEncryptedMaxmusicPrefs(context)
 
     LaunchedEffect(Unit) {
         val savedToken = prefs.getString("auth_token", null)
@@ -844,6 +858,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                                 if (success) {
                                     Logger.log("Успешный вход!")
                                     prefs.edit().putString("auth_token", maxClient.authToken).apply()
+                                    context.getSystemService(android.view.autofill.AutofillManager::class.java)?.commit()
                                     onAuthSuccess()
                                 } else {
                                     Logger.log("Неверный пароль или ошибка входа.")
@@ -884,7 +899,7 @@ fun MusicListScreen(
     var musicList by remember { mutableStateOf<List<MusicMessage>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     val context = androidx.compose.ui.platform.LocalContext.current
-    val prefs = context.getSharedPreferences("maxmusic_prefs", Context.MODE_PRIVATE)
+    val prefs = getEncryptedMaxmusicPrefs(context)
     var showPasswordDialog by remember { mutableStateOf(!CryptoManager.isPasswordSet) }
 
     if (showPasswordDialog) {
@@ -910,6 +925,8 @@ fun MusicListScreen(
                 Button(onClick = {
                     if (pwd.isNotBlank()) {
                         CryptoManager.setPassword(context, pwd)
+                        val autofillManager = context.getSystemService(android.view.autofill.AutofillManager::class.java)
+                        autofillManager?.commit()
                         showPasswordDialog = false
                     }
                 }) {

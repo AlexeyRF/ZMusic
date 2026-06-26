@@ -59,4 +59,5 @@ dependencies {
     
     // For editing audio metadata
     implementation("net.jthink:jaudiotagger:3.0.1")
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
 }
