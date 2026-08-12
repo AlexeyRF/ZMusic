@@ -122,7 +122,7 @@ class PlaybackService : Service() {
             .setState(
                 if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
                 AudioPlayer.currentPosition.value.toLong(),
-                if (isPlaying) 1f else 0f
+                if (isPlaying) AudioPlayer.currentSpeed else 0f
             )
         mediaSession.setPlaybackState(stateBuilder.build())
 
@@ -176,7 +176,7 @@ class PlaybackService : Service() {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(trackName)
             .setContentText("ZMusic")
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_music_note)
             .setContentIntent(pendingIntent)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(isPlaying)

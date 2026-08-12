@@ -86,7 +86,7 @@ object VibeManager {
     var currentVibeTargetBpm = 120f
     var consecutiveSkips = 0
 
-    val predictedEffects = mutableMapOf<Long, AudioEffectType>()
+    val predictedEffects = mutableMapOf<Long, Set<AudioEffectType>>()
     private val trackStats = mutableMapOf<String, TrackStats>()
     private var prefs: SharedPreferences? = null
 
@@ -142,23 +142,27 @@ object VibeManager {
         } catch (e: Exception) { e.printStackTrace() }
     }
 
-    fun analyzeTrackBpm(file: File, effectType: AudioEffectType): Float {
+    fun analyzeTrackBpm(file: File, effects: Set<AudioEffectType>): Float {
         // Fast heuristic analysis of BPM based on file size, name, and basic metrics
         val baseHash = abs(file.length() xor file.name.hashCode().toLong())
         val baseBpm = 70f + (baseHash % 110f) // between 70 and 180
         
-        return when (effectType) {
-            AudioEffectType.SPEED_UP, AudioEffectType.NIGHTCORE -> baseBpm * 1.25f
-            AudioEffectType.SLOWED, AudioEffectType.SLOWED_REVERB -> baseBpm * 0.8f
-            else -> baseBpm
+        var multiplier = 1.0f
+        if (effects.contains(AudioEffectType.SPEED_UP) || effects.contains(AudioEffectType.PITCH_UP)) {
+            multiplier *= 1.25f
         }
+        if (effects.contains(AudioEffectType.SLOWED) || effects.contains(AudioEffectType.PITCH_DOWN)) {
+            multiplier *= 0.8f
+        }
+        return baseBpm * multiplier
     }
 
-    private fun getTrackKey(fileId: Long, effect: AudioEffectType): String {
-        return "${fileId}_${effect.name}"
+    private fun getTrackKey(fileId: Long, effects: Set<AudioEffectType>): String {
+        val effectName = if (effects.isEmpty()) "NORMAL" else effects.map { it.name }.sorted().joinToString("+")
+        return "${fileId}_${effectName}"
     }
 
-    fun recordListenEvent(context: Context, fileId: Long, effect: AudioEffectType, file: File, listenMs: Long, totalMs: Long) {
+    fun recordListenEvent(context: Context, fileId: Long, effects: Set<AudioEffectType>, file: File, listenMs: Long, totalMs: Long) {
         val ratio = listenMs.toFloat() / totalMs.toFloat().coerceAtLeast(1f)
         
         // Track skips for Vibe shift (always evaluate skips if in Vibe mode)
@@ -177,10 +181,11 @@ object VibeManager {
         // For clean statistics, DO NOT collect history while inside Vibe mode
         if (isVibeModeEnabled.value) return
 
-        val key = getTrackKey(fileId, effect)
+        val key = getTrackKey(fileId, effects)
+        val effectName = if (effects.isEmpty()) "NORMAL" else effects.map { it.name }.sorted().joinToString("+")
         val stats = trackStats.getOrPut(key) {
-            TrackStats(fileId, effect.name).apply {
-                bpm = analyzeTrackBpm(file, effect)
+            TrackStats(fileId, effectName).apply {
+                bpm = analyzeTrackBpm(file, effects)
                 durationMs = totalMs
             }
         }
@@ -195,7 +200,7 @@ object VibeManager {
         Logger.log("Vibe shift! New target BPM: ${currentVibeTargetBpm.toInt()}")
     }
 
-    fun generateVibePlaylist(baseList: List<MusicMessage>): List<MusicMessage> {
+    fun generateVibePlaylist(baseList: List<MusicMessage>, activePlaylist: String? = null, context: Context? = null): List<MusicMessage> {
         if (baseList.isEmpty()) return baseList
 
         val cal = Calendar.getInstance()
@@ -207,16 +212,17 @@ object VibeManager {
         // Give each track a score and sort
         val scoredTracks = baseList.map { track ->
             var bestScore = -1000f
-            var bestEffect = AudioEffectType.NORMAL
+            var bestEffect = emptySet<AudioEffectType>()
 
             for (effect in AudioEffectType.values()) {
-                val key = getTrackKey(track.fileId, effect)
+                val effectSet = setOf(effect)
+                val key = getTrackKey(track.fileId, effectSet)
                 val stats = trackStats[key]
                 if (stats != null) {
                     val score = stats.getScore(currentVibeTargetBpm, currentHour, currentDay)
                     if (score > bestScore) {
                         bestScore = score
-                        bestEffect = effect
+                        bestEffect = effectSet
                     }
                 }
             }
@@ -226,7 +232,7 @@ object VibeManager {
                 bestScore = Random.nextFloat() * 5f // slight random boost
                 // Optionally give it a random effect occasionally
                 if (Random.nextFloat() > 0.8f) {
-                    bestEffect = AudioEffectType.values().random()
+                    bestEffect = setOf(AudioEffectType.values().random())
                 }
             }
 
@@ -234,6 +240,14 @@ object VibeManager {
 
             // Add extra random salt to make the vibe dynamic
             bestScore += (Random.nextFloat() * 2f)
+            
+            // "он должен учитывать плейлисты при подборе трека, но не зацикливаться на них"
+            if (activePlaylist != null && context != null) {
+                val pls = LocalMetadataManager.getPlaylists(context, track.fileId)
+                if (pls.contains(activePlaylist)) {
+                    bestScore += 3.0f // boost for being in the active playlist, but not an absolute lock
+                }
+            }
 
             Pair(track, bestScore)
         }

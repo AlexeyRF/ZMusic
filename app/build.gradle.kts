@@ -11,17 +11,20 @@ android {
         applicationId = "ru.alexeyrf.maxmusic"
         minSdk = 23
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 5
+        versionName = "1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
     compileOptions {
@@ -60,4 +63,5 @@ dependencies {
     // For editing audio metadata
     implementation("net.jthink:jaudiotagger:3.0.1")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.documentfile:documentfile:1.0.1")
 }

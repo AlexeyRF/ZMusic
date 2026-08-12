@@ -26,12 +26,17 @@ fun MetadataEditorDialog(
     initialTitle: String,
     initialArtist: String,
     initialCover: Bitmap?,
+    initialPlaylists: Set<String>,
+    allPlaylists: List<String>,
+    showEncryptionOption: Boolean = true,
     onDismiss: () -> Unit,
-    onSave: (String, String, Bitmap?) -> Unit
+    onSave: (String, String, Bitmap?, Boolean, Set<String>) -> Unit
 ) {
     var title by remember { mutableStateOf(initialTitle) }
     var artist by remember { mutableStateOf(initialArtist) }
     var cover by remember { mutableStateOf(initialCover) }
+    var useZ2 by remember { mutableStateOf(false) }
+    var selectedPlaylists by remember { mutableStateOf(initialPlaylists) }
 
     val context = LocalContext.current
     val imagePicker = rememberLauncherForActivityResult(
@@ -42,6 +47,7 @@ fun MetadataEditorDialog(
                 val source = ImageDecoder.createSource(context.contentResolver, it)
                 ImageDecoder.decodeBitmap(source)
             } else {
+                @Suppress("DEPRECATION")
                 MediaStore.Images.Media.getBitmap(context.contentResolver, it)
             }
             cover = bitmap
@@ -91,10 +97,35 @@ fun MetadataEditorDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                if (allPlaylists.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Плейлисты", style = MaterialTheme.typography.titleSmall)
+                    for (pl in allPlaylists) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = selectedPlaylists.contains(pl),
+                                onCheckedChange = { checked ->
+                                    val newSet = selectedPlaylists.toMutableSet()
+                                    if (checked) newSet.add(pl) else newSet.remove(pl)
+                                    selectedPlaylists = newSet
+                                }
+                            )
+                            Text(pl)
+                        }
+                    }
+                }
+                
+                if (showEncryptionOption && CryptoManager.isPasswordSet) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = useZ2, onCheckedChange = { useZ2 = it })
+                        Text("Шифровать метаданные (.z2)")
+                    }
+                }
             }
         },
         confirmButton = {
-            Button(onClick = { onSave(title, artist, cover) }) {
+            Button(onClick = { onSave(title, artist, cover, useZ2, selectedPlaylists) }) {
                 Text("Сохранить")
             }
         },

@@ -47,6 +47,45 @@ class MaxClient(
     var isAuthenticated = false
     var authToken: String? = null
     var authTrackId: String? = null
+    
+    private var callsSeed: Long = 0L
+    private var deviceId: String = ""
+
+    private fun hexStringToByteArray(s: String): ByteArray {
+        val len = s.length
+        val data = ByteArray(len / 2)
+        for (i in 0 until len step 2) {
+            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+        }
+        return data
+    }
+
+    private fun generateFingerprint(): ByteArray {
+        val certHash = hexStringToByteArray("1684414033eb263e2c615f8b7df5ed8793850a07656304997fbf07e9e21e1e93")
+        val dexHash = hexStringToByteArray("8db68fcc0e85e8f041fe4a875c0a9bcfe542a8f679603728c651ed81b64dd684")
+        val soHash = hexStringToByteArray("634ecc42b246784d975f180b4fecf903df235cdf0476da47163a85630eb1a6a8")
+        
+        val seedBytes = ByteBuffer.allocate(8).putLong(callsSeed).array()
+        val deviceBytes = deviceId.toByteArray(Charsets.UTF_8)
+        
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        
+        md.update(certHash)
+        md.update(seedBytes)
+        val h1 = md.digest(deviceBytes)
+        
+        md.reset()
+        md.update(dexHash)
+        md.update(seedBytes)
+        val h2 = md.digest(deviceBytes)
+        
+        md.reset()
+        md.update(soHash)
+        md.update(seedBytes)
+        val h3 = md.digest(deviceBytes)
+        
+        return h1 + h2 + h3
+    }
 
     suspend fun connect() = withContext(Dispatchers.IO) {
         try {
@@ -80,23 +119,29 @@ class MaxClient(
             val screenStr = "${metrics.densityDpi}dpi ${metrics.densityDpi}dpi ${metrics.widthPixels}x${metrics.heightPixels}"
 
             // Отправляем первый пакет SESSION_INIT (opcode: 6)
+            val newDeviceId = java.util.UUID.randomUUID().toString()
             val handshakePayload = mapOf(
                 "mt_instanceid" to java.util.UUID.randomUUID().toString(),
                 "userAgent" to mapOf(
                     "deviceType" to "ANDROID",
-                    "appVersion" to "26.14.1",
+                    "appVersion" to "26.25.0",
                     "osVersion" to osVersion,
                     "timezone" to timezone,
                     "screen" to screenStr,
                     "locale" to "ru",
                     "deviceName" to deviceName,
-                    "deviceLocale" to "ru"
+                    "deviceLocale" to "ru",
+                    "pushDeviceType" to "GCM",
+                    "arch" to "arm64-v8a",
+                    "buildNumber" to 6790
                 ),
                 "clientSessionId" to 1,
-                "deviceId" to java.util.UUID.randomUUID().toString()
+                "deviceId" to newDeviceId
             )
-            sendRequest(cmd = 0, opcode = 6, payload = handshakePayload)
-            Log.d(tag, "Connected and session initialized")
+            val sessionRes = sendRequest(cmd = 0, opcode = 6, payload = handshakePayload)
+            deviceId = newDeviceId
+            callsSeed = (sessionRes["callsSeed"] as? Number)?.toLong() ?: 0L
+            Log.d(tag, "Connected and session initialized, callsSeed=${callsSeed}")
         } catch (e: Exception) {
             Log.e(tag, "Connection failed", e)
             throw e
@@ -224,7 +269,8 @@ class MaxClient(
     // --- Авторизация ---
     suspend fun sendPhone(phone: String): Boolean {
         // AUTH_REQUEST = 17
-        val res = sendRequest(0, 17, mapOf("phone" to phone, "type" to "START_AUTH", "language" to "ru"))
+        val modeBytes = generateFingerprint()
+        val res = sendRequest(0, 17, mapOf("phone" to phone, "type" to "START_AUTH", "mode" to modeBytes, "language" to "ru"))
         authToken = res["token"] as? String
         if (authToken == null) {
             throw Exception("Ответ сервера не содержит token: $res")
@@ -288,7 +334,7 @@ class MaxClient(
         val res = sendRequest(0, 19, mapOf(
             "token" to token,
             "userAgent" to mapOf(
-                "appVersion" to "26.14.1", 
+                "appVersion" to "26.25.0", 
                 "deviceType" to "ANDROID",
                 "systemVersion" to systemVersion,
                 "deviceName" to deviceName,
@@ -319,54 +365,134 @@ class MaxClient(
         }
     }
 
+    private fun fixEncoding(text: String?): String? {
+        if (text == null) return null
+        
+        // Check for CP1251 decoded as CP1252/Latin1 (characters in \u00C0-\u00FF range, e.g. Áóì)
+        val hasLatin1Cyrillic = text.any { it.code in 0xC0..0xFF }
+        // Check for UTF-8 decoded as CP1252/Latin1
+        val hasUtf8AsLatin1 = text.contains('\u00D0') || text.contains('\u00D1')
+        
+        if (hasLatin1Cyrillic || hasUtf8AsLatin1) {
+            try {
+                // Try treating the string as CP1252 bytes
+                val cp1252 = java.nio.charset.Charset.forName("windows-1252")
+                val cp1251 = java.nio.charset.Charset.forName("windows-1251")
+                val utf8 = Charsets.UTF_8
+                
+                // Convert chars back to bytes
+                val bytes = text.toByteArray(cp1252)
+                
+                // If it looks like UTF-8 (has 0xD0/0xD1), try UTF-8 first
+                if (hasUtf8AsLatin1) {
+                    try {
+                        // Validate UTF-8 decoding
+                        val decodedUtf8 = String(bytes, utf8)
+                        if (!decodedUtf8.contains("\uFFFD")) {
+                            return decodedUtf8
+                        }
+                    } catch (e: Exception) {}
+                }
+                
+                // Otherwise try CP1251
+                return String(bytes, cp1251)
+            } catch (e: Exception) {
+                // ignore
+            }
+        }
+        return text
+    }
+
     // --- Работа с Музыкой ---
+    private var cachedMusicList: MutableList<MusicMessage>? = null
+    private var isHistoryFullyLoaded = false
+
     suspend fun getSavedMusic(retryCount: Int = 1): List<MusicMessage> {
         try {
             if (!isConnected()) {
                 resumeSession()
             }
-            // CHAT_HISTORY = 49 (чат 0)
-            val res = sendRequest(0, 49, mapOf(
-                "chatId" to 0,
-                "backward" to 100,
-                "from" to System.currentTimeMillis(),
-                "itemType" to "REGULAR",
-                "getMessages" to true,
-                "interactive" to false
-            ), timeoutMs = 15000L) // reduced timeout to fail faster on dead sockets
+            
+            val allMessages = mutableListOf<MusicMessage>()
+            val knownIds = cachedMusicList?.map { it.messageId }?.toSet() ?: emptySet()
+            var currentFrom = System.currentTimeMillis()
+            var reachedKnown = false
+            var apiCalls = 0
+            
+            while (!reachedKnown && apiCalls < 50) { // max 5000 messages history
+                apiCalls++
+                val res = sendRequest(0, 49, mapOf(
+                    "chatId" to 0,
+                    "backward" to 100,
+                    "from" to currentFrom,
+                    "itemType" to "REGULAR",
+                    "getMessages" to true,
+                    "interactive" to false
+                ), timeoutMs = 15000L) // reduced timeout to fail faster on dead sockets
+                
+                val msgsList = res["messages"] as? List<*> ?: break
+                if (msgsList.isEmpty()) {
+                    isHistoryFullyLoaded = true
+                    break
+                }
+                
+                var minTime = currentFrom
+                var fetchedCount = 0
+                
+                for (msgObj in msgsList) {
+                    val msg = msgObj as? Map<*, *> ?: continue
+                    val msgId = (msg["id"] as? Number)?.toLong() ?: continue
+                    val msgTime = (msg["time"] as? Number)?.toLong() ?: continue
+                    
+                    if (msgTime < minTime) minTime = msgTime
+                    fetchedCount++
+                    
+                    if (msgId in knownIds) {
+                        reachedKnown = true
+                        continue
+                    }
+                    
+                    val attaches = msg["attaches"] as? List<*> ?: continue
+                    for (attachObj in attaches) {
+                        val attach = attachObj as? Map<*, *> ?: continue
+                        val fileId = (attach["fileId"] as? Number)?.toLong()
 
-            val messages = mutableListOf<MusicMessage>()
-            val msgsList = res["messages"] as? List<*> ?: return emptyList()
+                        var filename = attach["filename"] as? String
+                            ?: attach["fileName"] as? String
+                            ?: attach["name"] as? String
+                            ?: attach["title"] as? String
+                            ?: (attach["file"] as? Map<*, *>)?.get("name") as? String
+                            ?: (attach["file"] as? Map<*, *>)?.get("filename") as? String
+                            ?: "Unknown file"
+                            
+                        filename = fixEncoding(filename) ?: "Unknown file"
 
-            for (msgObj in msgsList) {
-                val msg = msgObj as? Map<*, *> ?: continue
-                val msgId = (msg["id"] as? Number)?.toLong() ?: continue
+                        val ext = filename.substringAfterLast('.', "").lowercase()
 
-                val attaches = msg["attaches"] as? List<*> ?: continue
-                for (attachObj in attaches) {
-                    val attach = attachObj as? Map<*, *> ?: continue
-                    val fileId = (attach["fileId"] as? Number)?.toLong()
+                        val preview = attach["preview"] as? Map<*, *>
+                        val serverTitle = fixEncoding(preview?.get("title") as? String)
+                        val serverArtist = fixEncoding(preview?.get("artist") as? String)
 
-                    val filename = attach["filename"] as? String
-                        ?: attach["fileName"] as? String
-                        ?: attach["name"] as? String
-                        ?: attach["title"] as? String
-                        ?: (attach["file"] as? Map<*, *>)?.get("name") as? String
-                        ?: (attach["file"] as? Map<*, *>)?.get("filename") as? String
-                        ?: "Unknown file"
-
-                    val ext = filename.substringAfterLast('.', "").lowercase()
-
-                    val preview = attach["preview"] as? Map<*, *>
-                    val serverTitle = preview?.get("title") as? String
-                    val serverArtist = preview?.get("artist") as? String
-
-                    if (fileId != null && ext in listOf("mp3", "flac", "wav", "zmusic")) {
-                        messages.add(MusicMessage(msgId, fileId, filename, "", 0, serverTitle, serverArtist))
+                        if (fileId != null && (ext in listOf("mp3", "flac", "wav", "zmusic", "z2", "mp4", "mkv", "avi", "webm", "mov") || filename.contains(".zconfig"))) {
+                            allMessages.add(MusicMessage(msgId, fileId, filename, "", 0, serverTitle, serverArtist))
+                        }
                     }
                 }
+                
+                if (reachedKnown) break
+                if (fetchedCount < 100) {
+                    isHistoryFullyLoaded = true
+                    break
+                }
+                currentFrom = minTime
             }
-            return messages
+            
+            val combined = (allMessages + (cachedMusicList ?: emptyList()))
+                .distinctBy { it.messageId }
+                .sortedByDescending { it.messageId }
+            
+            cachedMusicList = combined.toMutableList()
+            return cachedMusicList!!
         } catch (e: Exception) {
             Log.e(tag, "Failed to getSavedMusic, retryCount=$retryCount", e)
             if (retryCount > 0) {
@@ -374,7 +500,7 @@ class MaxClient(
                 return getSavedMusic(retryCount - 1)
             }
             // If all retries fail, return cached tracks
-            return ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks()
+            return cachedMusicList ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks()
         }
     }
     
@@ -393,6 +519,24 @@ class MaxClient(
         } catch (e: Exception) {
             Log.e(tag, "getFileDownloadUrl failed", e)
             null
+        }
+    }
+
+    suspend fun deleteTrack(msgId: Long): Boolean = withContext(Dispatchers.IO) {
+        if (!isConnected()) return@withContext false
+        try {
+            // MSG_DELETE = 66
+            val payload = mapOf(
+                "chatId" to 0,
+                "messageIds" to listOf(msgId),
+                "forMe" to false
+            )
+            sendRequest(0, 66, payload, timeoutMs = 10000L)
+            cachedMusicList?.removeAll { it.messageId == msgId }
+            true
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to delete track", e)
+            false
         }
     }
 
@@ -553,6 +697,7 @@ class MaxClient(
             val unpacker = MessagePack.newDefaultUnpacker(bytes)
             if (!unpacker.hasNext()) return emptyMap()
             val value = unpacker.unpackValue()
+            @Suppress("UNCHECKED_CAST")
             return unpackValue(value) as? Map<String, Any> ?: emptyMap()
         } catch (e: Exception) {
             Log.e(tag, "Msgpack decode error", e)
