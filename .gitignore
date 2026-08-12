@@ -14,3 +14,5 @@
 .cxx
 local.properties
 /app/release/app-release.apk
+/output.txt
+/test_enc.py
