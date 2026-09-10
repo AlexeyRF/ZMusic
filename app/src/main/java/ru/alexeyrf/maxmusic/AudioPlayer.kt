@@ -78,7 +78,8 @@ enum class AudioEffectType(val title: String) {
     SPEED_UP("Speed Up"),
     SLOWED("Slowed"),
     PITCH_UP("Pitch Up"),
-    PITCH_DOWN("Pitch Down")
+    PITCH_DOWN("Pitch Down"),
+    REVERB("Reverb")
 }
 
 object AudioPlayer {
@@ -105,6 +106,13 @@ object AudioPlayer {
     
     var playlist = listOf<ru.alexeyrf.maxmusic.client.MusicMessage>()
     var currentTrackIndex = -1
+    val trackHistory = mutableListOf<Int>()
+    var historyIndex = -1
+    val customSpeed = androidx.compose.runtime.mutableStateOf<Float?>(null)
+    val customReverbDelay = androidx.compose.runtime.mutableStateOf<Int?>(null)
+    private var reverbMediaPlayer: android.media.MediaPlayer? = null
+    private var reverbJob: kotlinx.coroutines.Job? = null
+    private var lastUrl: String? = null
     
     var maxClient: ru.alexeyrf.maxmusic.client.MaxClient? = null
     var appContext: Context? = null
@@ -132,12 +140,24 @@ object AudioPlayer {
         maxClient = client
         playlist = list
         currentTrackIndex = startIndex
+        trackHistory.clear()
+        trackHistory.add(startIndex)
+        historyIndex = 0
     }
     
     fun rebuildVibePlaylist(context: Context, fullList: List<ru.alexeyrf.maxmusic.client.MusicMessage>? = null, activePlaylist: String? = null) {
         if (VibeManager.isVibeModeEnabled.value) {
             val baseList = fullList ?: playlist
+            val oldHistoryTracks = trackHistory.mapNotNull { playlist.getOrNull(it) }
             playlist = VibeManager.generateVibePlaylist(baseList, activePlaylist, context)
+            trackHistory.clear()
+            for (track in oldHistoryTracks) {
+                val newIdx = playlist.indexOfFirst { it.fileId == track.fileId }
+                if (newIdx != -1) trackHistory.add(newIdx)
+            }
+            trackHistory.add(0)
+            if (trackHistory.size > 500) trackHistory.removeAt(0)
+            historyIndex = trackHistory.size - 1
             currentTrackIndex = 0
             playCurrentTrack()
         }
@@ -206,6 +226,25 @@ object AudioPlayer {
     fun seekTo(positionMs: Int) {
         mediaPlayer?.seekTo(positionMs)
         currentPosition.value = positionMs
+        val delay = customReverbDelay.value
+        if (delay != null && delay > 0 && reverbMediaPlayer != null) {
+            val effectiveDelay = (delay / currentSpeed).toInt()
+            val targetPos = positionMs - effectiveDelay
+            reverbJob?.cancel()
+            if (targetPos > 0) {
+                reverbMediaPlayer?.seekTo(targetPos)
+                if (isPlayingState.value) reverbMediaPlayer?.start()
+            } else {
+                reverbMediaPlayer?.pause()
+                if (isPlayingState.value) {
+                    reverbJob = CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                        kotlinx.coroutines.delay(-targetPos.toLong())
+                        reverbMediaPlayer?.seekTo(0)
+                        reverbMediaPlayer?.start()
+                    }
+                }
+            }
+        }
         appContext?.let { updateService(it) }
     }
     
@@ -213,6 +252,14 @@ object AudioPlayer {
         if (playlist.isEmpty()) return
         if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
         val context = appContext ?: return
+        
+        if ((playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
+            historyIndex++
+            currentTrackIndex = trackHistory[historyIndex]
+            playCurrentTrack()
+            return
+        }
+
         var nextIndex = currentTrackIndex
         var attempts = 0
         
@@ -264,6 +311,10 @@ object AudioPlayer {
         } while (true)
         
         currentTrackIndex = nextIndex
+        if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+        trackHistory.add(nextIndex)
+        if (trackHistory.size > 500) trackHistory.removeAt(0)
+        historyIndex = trackHistory.size - 1
         playCurrentTrack()
     }
     
@@ -271,6 +322,14 @@ object AudioPlayer {
         if (playlist.isEmpty()) return
         if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
         val context = appContext ?: return
+        
+        if ((playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex > 0) {
+            historyIndex--
+            currentTrackIndex = trackHistory[historyIndex]
+            playCurrentTrack()
+            return
+        }
+
         var nextIndex = currentTrackIndex
         var attempts = 0
         
@@ -290,6 +349,16 @@ object AudioPlayer {
         } while (true)
         
         currentTrackIndex = nextIndex
+        if (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) {
+            trackHistory.add(0, nextIndex)
+            if (trackHistory.size > 500) trackHistory.removeAt(trackHistory.size - 1)
+            historyIndex = 0
+        } else {
+            if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+            trackHistory.add(nextIndex)
+            if (trackHistory.size > 500) trackHistory.removeAt(0)
+            historyIndex = trackHistory.size - 1
+        }
         playCurrentTrack()
     }
     
@@ -350,6 +419,7 @@ object AudioPlayer {
             try { currentFis?.close() } catch (e: Exception) {}
             currentFis = null
             
+            lastUrl = url
             var finalTrackName = trackName
             var currentMetaTitle: String? = null
             var currentMetaArtist: String? = null
@@ -411,6 +481,7 @@ object AudioPlayer {
                     applyEffects()
                     mp.start() 
                     isPlayingState.value = true
+                    syncReverb()
                     AudioPlayer.duration.value = mp.duration
                     currentTrackStartTime = System.currentTimeMillis()
                     
@@ -452,6 +523,8 @@ object AudioPlayer {
         if (mediaPlayer?.isPlaying == true) {
             mediaPlayer?.pause()
         }
+        reverbMediaPlayer?.pause()
+        reverbJob?.cancel()
         isPlayingState.value = false
         progressJob?.cancel()
         context?.let { updateService(it) }
@@ -460,6 +533,21 @@ object AudioPlayer {
     fun resume(context: Context? = null) {
         mediaPlayer?.start()
         isPlayingState.value = true
+        val delay = customReverbDelay.value
+        if (delay != null && delay > 0 && reverbMediaPlayer != null) {
+            val effectiveDelay = (delay / currentSpeed).toInt()
+            val targetPos = (mediaPlayer?.currentPosition ?: 0) - effectiveDelay
+            if (targetPos > 0) {
+                reverbMediaPlayer?.seekTo(targetPos)
+                reverbMediaPlayer?.start()
+            } else {
+                reverbJob?.cancel()
+                reverbJob = CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                    kotlinx.coroutines.delay(-targetPos.toLong())
+                    reverbMediaPlayer?.start()
+                }
+            }
+        }
         progressJob?.cancel()
         progressJob = CoroutineScope(Dispatchers.Main).launch {
             while(true) {
@@ -507,8 +595,16 @@ object AudioPlayer {
             
             var speed = 1.0f
             var pitch = 1.0f
-            if (activeEffects.contains(AudioEffectType.SPEED_UP)) speed *= 1.25f
-            if (activeEffects.contains(AudioEffectType.SLOWED)) speed *= 0.8f
+            
+            val activeCustomEffectName = activeCustomEffects.firstOrNull()
+            val effectSpeed = if (activeCustomEffectName != null && appContext != null) LocalMetadataManager.getCustomEffectSpeed(appContext!!, activeCustomEffectName) else customSpeed.value
+            
+            if (effectSpeed != null) {
+                speed = effectSpeed
+            } else {
+                if (activeEffects.contains(AudioEffectType.SPEED_UP)) speed *= 1.25f
+                if (activeEffects.contains(AudioEffectType.SLOWED)) speed *= 0.8f
+            }
             if (activeEffects.contains(AudioEffectType.PITCH_UP)) pitch *= 1.25f
             if (activeEffects.contains(AudioEffectType.PITCH_DOWN)) pitch *= 0.8f
             currentSpeed = speed
@@ -518,6 +614,26 @@ object AudioPlayer {
                     this.speed = speed
                     this.pitch = pitch
                 }
+                if (!isPlayingState.value) mp.pause()
+                
+                try {
+                    reverbMediaPlayer?.let { rmp ->
+                        rmp.playbackParams = rmp.playbackParams.apply {
+                            this.speed = speed
+                            this.pitch = pitch
+                        }
+                        if (!isPlayingState.value) rmp.pause()
+                    }
+                } catch (e: Exception) {}
+            }
+            
+            val hasCustomReverb = activeCustomEffectName != null && appContext != null && LocalMetadataManager.getCustomEffectReverb(appContext!!, activeCustomEffectName) != null
+            if (activeEffects.contains(AudioEffectType.REVERB) || hasCustomReverb) {
+                syncReverb()
+            } else {
+                reverbJob?.cancel()
+                reverbMediaPlayer?.release()
+                reverbMediaPlayer = null
             }
             
             if (activeEffects.contains(AudioEffectType.BASSBOOST)) {
@@ -570,8 +686,14 @@ object AudioPlayer {
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
+        reverbJob?.cancel()
+        reverbMediaPlayer?.stop()
+        reverbMediaPlayer?.release()
+        reverbMediaPlayer = null
         try { currentFis?.close() } catch (e: Exception) {}
         currentFis = null
+        reverbMediaPlayer?.pause()
+        reverbJob?.cancel()
         isPlayingState.value = false
         progressJob?.cancel()
         currentTrackName.value = null
@@ -593,5 +715,65 @@ object AudioPlayer {
             context.startService(intent)
         }
     }
-}
 
+    fun syncReverb() {
+        reverbJob?.cancel()
+        reverbMediaPlayer?.release()
+        reverbMediaPlayer = null
+        
+        val hasCustomReverb = activeCustomEffects.firstOrNull()?.let { appContext?.let { ctx -> LocalMetadataManager.getCustomEffectReverb(ctx, it) } } != null
+        if (!activeEffects.contains(AudioEffectType.REVERB) && !hasCustomReverb) return
+
+        val activeCustomEffectName = activeCustomEffects.firstOrNull()
+        val customReverb = if (activeCustomEffectName != null && appContext != null) LocalMetadataManager.getCustomEffectReverb(appContext!!, activeCustomEffectName) else null
+        
+        val delayMsBase = customReverb ?: (customReverbDelay.value ?: 150)
+        val effectiveDelay = (delayMsBase / currentSpeed).toInt()
+        val url = lastUrl
+        if (effectiveDelay > 0 && url != null) {
+            reverbMediaPlayer = android.media.MediaPlayer().apply {
+                setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                        .build()
+                )
+                try {
+                    if (url.startsWith("/")) {
+                        val fis = java.io.FileInputStream(url)
+                        setDataSource(fis.fd)
+                    } else {
+                        setDataSource(url)
+                    }
+                    setVolume(0.3f, 0.3f)
+                    prepareAsync()
+                    setOnPreparedListener { rmp ->
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                            var pitch = 1.0f
+                            if (activeEffects.contains(AudioEffectType.PITCH_UP)) pitch *= 1.25f
+                            if (activeEffects.contains(AudioEffectType.PITCH_DOWN)) pitch *= 0.8f
+                            rmp.playbackParams = rmp.playbackParams.apply {
+                                this.speed = currentSpeed
+                                this.pitch = pitch
+                            }
+                            if (!isPlayingState.value) rmp.pause()
+                        }
+                        
+                        val targetPos = (mediaPlayer?.currentPosition ?: 0) - effectiveDelay
+                        if (targetPos > 0) {
+                            rmp.seekTo(targetPos)
+                            if (isPlayingState.value) rmp.start()
+                        } else {
+                            if (isPlayingState.value) {
+                                reverbJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                                    kotlinx.coroutines.delay(-targetPos.toLong())
+                                    rmp.start()
+                                }
+                            }
+                        }
+                    }
+                } catch(e:Exception) {}
+            }
+        }
+    }
+}

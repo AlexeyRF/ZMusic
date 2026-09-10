@@ -133,12 +133,35 @@ object LocalMetadataManager {
         prefs.edit().putString("default_playlist", name).apply()
     }
     
-    fun saveCustomEffect(context: Context, name: String, levels: List<Short>) {
+    fun saveCustomEffect(context: Context, name: String, levels: List<Short>, speed: Float? = null, reverb: Int? = null) {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString("effect_$name", levels.joinToString(",")).apply()
+        if (speed != null) prefs.edit().putFloat("effect_speed_$name", speed).apply() else prefs.edit().remove("effect_speed_$name").apply()
+        if (reverb != null) prefs.edit().putInt("effect_reverb_$name", reverb).apply() else prefs.edit().remove("effect_reverb_$name").apply()
         
         val all = prefs.getStringSet("all_custom_effects", emptySet())?.toMutableSet() ?: mutableSetOf()
         all.add(name)
+        prefs.edit().putStringSet("all_custom_effects", all).apply()
+    }
+
+    fun getCustomEffectSpeed(context: Context, name: String): Float? {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        return if (prefs.contains("effect_speed_$name")) prefs.getFloat("effect_speed_$name", 1f) else null
+    }
+
+    fun getCustomEffectReverb(context: Context, name: String): Int? {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        return if (prefs.contains("effect_reverb_$name")) prefs.getInt("effect_reverb_$name", 0) else null
+    }
+
+    fun deleteCustomEffect(context: Context, name: String) {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        prefs.edit().remove("effect_$name")
+             .remove("effect_speed_$name")
+             .remove("effect_reverb_$name")
+             .apply()
+        val all = prefs.getStringSet("all_custom_effects", emptySet())?.toMutableSet() ?: mutableSetOf()
+        all.remove(name)
         prefs.edit().putStringSet("all_custom_effects", all).apply()
     }
     

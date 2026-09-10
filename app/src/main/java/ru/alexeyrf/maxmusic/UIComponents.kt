@@ -10,6 +10,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
@@ -990,6 +991,8 @@ fun MusicListScreen(
                         )
                         var showEffects by remember { mutableStateOf(false) }
                         var showCustomEqDialog by remember { mutableStateOf(false) }
+                        var showSpeedDialog by remember { mutableStateOf(false) }
+                        
                         
                         if (showCustomEqDialog) {
                             val eq = AudioPlayer.equalizer
@@ -1002,6 +1005,9 @@ fun MusicListScreen(
                                 )
                             } else {
                                 var newEffectName by remember { mutableStateOf("") }
+                                var tempSpeed by remember { mutableStateOf(AudioPlayer.customSpeed.value ?: 1f) }
+                                var tempReverb by remember { mutableStateOf(AudioPlayer.customReverbDelay.value ?: 0) }
+                                var tempReverbStr by remember { mutableStateOf(if (tempReverb > 0) tempReverb.toString() else "") }
                                 val numBands = eq.numberOfBands
                                 val range = eq.bandLevelRange
                                 val minLevel = range[0].toFloat()
@@ -1022,13 +1028,49 @@ fun MusicListScreen(
                                     },
                                     title = { Text("Создать эффект") },
                                     text = {
-                                        Column {
+                                        Column(modifier = Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                                             OutlinedTextField(
                                                 value = newEffectName,
                                                 onValueChange = { newEffectName = it },
-                                                label = { Text("Название эффекта") },
+                                                label = { Text("Имя пресета") },
                                                 singleLine = true
                                             )
+                                            Spacer(Modifier.height(8.dp))
+                                            Text("Скорость: ${String.format("%.2f", tempSpeed)}x")
+                                            Slider(
+                                                value = tempSpeed,
+                                                onValueChange = { tempSpeed = it; AudioPlayer.customSpeed.value = it },
+                                                onValueChangeFinished = { AudioPlayer.applyEffects() },
+                                                valueRange = 0.1f..5.0f
+                                            )
+                                            Text("Реверберация (0 = Выкл)")
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Slider(
+                                                    value = tempReverb.toFloat(),
+                                                    onValueChange = { 
+                                                        tempReverb = it.toInt()
+                                                        tempReverbStr = if (tempReverb > 0) tempReverb.toString() else ""
+                                                        AudioPlayer.customReverbDelay.value = if (tempReverb > 0) tempReverb else null
+                                                    },
+                                                    onValueChangeFinished = { AudioPlayer.applyEffects() },
+                                                    valueRange = 0f..500f,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                OutlinedTextField(
+                                                    value = tempReverbStr,
+                                                    onValueChange = { 
+                                                        tempReverbStr = it
+                                                        val parsed = it.toIntOrNull()
+                                                        if (parsed != null) {
+                                                            tempReverb = parsed
+                                                            AudioPlayer.customReverbDelay.value = if (parsed > 0) parsed else null
+                                                            AudioPlayer.applyEffects()
+                                                        }
+                                                    },
+                                                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                                                    modifier = Modifier.width(80.dp)
+                                                )
+                                            }
                                             Spacer(Modifier.height(8.dp))
                                             for (i in 0 until numBands) {
                                                 val freq = eq.getCenterFreq(i.toShort()) / 1000
@@ -1047,7 +1089,9 @@ fun MusicListScreen(
                                     confirmButton = {
                                         Button(onClick = {
                                             if (newEffectName.isNotBlank()) {
-                                                LocalMetadataManager.saveCustomEffect(context, newEffectName, bandLevels.toList())
+                                                val spd = if (tempSpeed != 1f) tempSpeed else null
+                                                val rvb = if (tempReverb > 0) tempReverb else null
+                                                LocalMetadataManager.saveCustomEffect(context, newEffectName, bandLevels.toList(), spd, rvb)
                                                 AudioPlayer.toggleCustomEffect(newEffectName)
                                             }
                                             showCustomEqDialog = false
@@ -1062,11 +1106,23 @@ fun MusicListScreen(
                                 )
                             }
                         }
+
+
                         
                         Box {
+                            val effectsCount = AudioPlayer.activeEffects.size
                             val activeText = if (AudioPlayer.activeCustomEffects.isNotEmpty()) AudioPlayer.activeCustomEffects.first() 
-                                             else if (AudioPlayer.activeEffects.isEmpty()) "Обычный" 
-                                             else AudioPlayer.activeEffects.joinToString(", ") { it.title }
+                                             else if (AudioPlayer.activeEffects.isEmpty()) "Без эффектов" 
+                                             else AudioPlayer.activeEffects.joinToString(", ") { effect ->
+                                                 when (effect) {
+                                                     AudioEffectType.BASSBOOST -> if (effectsCount >= 4) "BB" else if (effectsCount == 3) "Bass" else if (effectsCount == 2) "BassBst" else "BassBoost"
+                                                     AudioEffectType.PITCH_DOWN -> if (effectsCount >= 4) "PD" else if (effectsCount == 3) "PDn" else if (effectsCount == 2) "PDown" else "Pitch Down"
+                                                     AudioEffectType.PITCH_UP -> if (effectsCount >= 4) "PU" else if (effectsCount == 3) "PUp" else if (effectsCount == 2) "PUp" else "Pitch Up"
+                                                     AudioEffectType.SPEED_UP -> if (effectsCount >= 4) "SU" else if (effectsCount == 3) "SpU" else if (effectsCount == 2) "SpeedU" else "Speed Up"
+                                                     AudioEffectType.SLOWED -> if (effectsCount >= 4) "Sl" else if (effectsCount == 3) "Slw" else if (effectsCount == 2) "Slow" else "Slowed"
+                                                     AudioEffectType.REVERB -> if (effectsCount >= 4) "Rv" else if (effectsCount == 3) "Rev" else if (effectsCount == 2) "Reverb" else "Reverb"
+                                                 }
+                                             }
                             TextButton(onClick = { showEffects = true }) {
                                 Text(activeText)
                             }
@@ -1092,7 +1148,21 @@ fun MusicListScreen(
                                     customEffects.keys.forEach { effectName ->
                                         val isSelected = AudioPlayer.activeCustomEffects.contains(effectName)
                                         DropdownMenuItem(
-                                            text = { Text(effectName) },
+                                            text = { 
+                                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                                    Text(effectName, modifier = Modifier.weight(1f))
+                                                    IconButton(onClick = { 
+                                                        LocalMetadataManager.deleteCustomEffect(context, effectName)
+                                                        if (isSelected) {
+                                                            AudioPlayer.activeCustomEffects.remove(effectName)
+                                                            AudioPlayer.applyEffects()
+                                                        }
+                                                        showEffects = false
+                                                    }) {
+                                                        Icon(androidx.compose.material.icons.Icons.Default.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)
+                                                    }
+                                                }
+                                            },
                                             leadingIcon = {
                                                 if (isSelected) {
                                                     Icon(Icons.Default.Check, contentDescription = null)
@@ -1111,6 +1181,8 @@ fun MusicListScreen(
                                         showCustomEqDialog = true 
                                     }
                                 )
+                                HorizontalDivider()
+
                             }
                         }
                     }
@@ -1609,6 +1681,44 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
                             materialEnabled = it
                             prefs.edit().putBoolean("material_ui", it).apply()
                         }
+                    )
+                }
+                
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                Text("Настройки эффектов", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                Text("Задержка реверберации (мс)", style = MaterialTheme.typography.bodyMedium)
+                var tempReverb by remember { mutableStateOf(AudioPlayer.customReverbDelay.value ?: 0) }
+                var tempReverbStr by remember { mutableStateOf(if (tempReverb > 0) tempReverb.toString() else "") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Slider(
+                        value = tempReverb.toFloat(),
+                        onValueChange = { 
+                            tempReverb = it.toInt()
+                            tempReverbStr = if (tempReverb > 0) tempReverb.toString() else ""
+                            AudioPlayer.customReverbDelay.value = if (tempReverb > 0) tempReverb else null
+                            if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                        },
+                        valueRange = 0f..500f,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = tempReverbStr,
+                        onValueChange = { 
+                            tempReverbStr = it
+                            val parsed = it.toIntOrNull()
+                            if (parsed != null) {
+                                tempReverb = parsed
+                                AudioPlayer.customReverbDelay.value = if (parsed > 0) parsed else null
+                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                            } else if (it.isEmpty()) {
+                                tempReverb = 0
+                                AudioPlayer.customReverbDelay.value = null
+                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                            }
+                        },
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                        modifier = Modifier.width(80.dp)
                     )
                 }
 
