@@ -39,6 +39,7 @@ class MaxClient(
     private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
     private val seqCounter = java.util.concurrent.atomic.AtomicInteger(0)
+    var context: android.content.Context? = null
 
     private val readerScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val pendingRequests = ConcurrentHashMap<Int, CompletableDeferred<Map<String, Any>>>()
@@ -408,6 +409,18 @@ class MaxClient(
     private var isHistoryFullyLoaded = false
 
     suspend fun getSavedMusic(retryCount: Int = 1): List<MusicMessage> {
+        if (authToken == null) {
+            val localDir = java.io.File(context?.filesDir, "local_tracks")
+            if (!localDir.exists()) localDir.mkdirs()
+            val files = localDir.listFiles() ?: emptyArray()
+            val list = mutableListOf<MusicMessage>()
+            for (file in files) {
+                val fileId = file.name.hashCode().toLong()
+                val messageId = file.lastModified()
+                list.add(MusicMessage(messageId, fileId, file.name, file.absolutePath, 0, null, null))
+            }
+            return list.sortedByDescending { it.messageId }
+        }
         try {
             if (!isConnected()) {
                 resumeSession()
@@ -505,6 +518,16 @@ class MaxClient(
     }
     
     suspend fun getFileDownloadUrl(messageId: Long, fileId: Long): String? {
+        if (authToken == null) {
+            val localDir = java.io.File(context?.filesDir, "local_tracks")
+            val files = localDir.listFiles() ?: emptyArray()
+            for (file in files) {
+                if (file.name.hashCode().toLong() == fileId) {
+                    return "file://" + file.absolutePath
+                }
+            }
+            return null
+        }
         return try {
             if (!isConnected()) {
                 resumeSession()

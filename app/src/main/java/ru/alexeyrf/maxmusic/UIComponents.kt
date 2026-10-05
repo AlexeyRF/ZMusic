@@ -102,18 +102,21 @@ fun MusicListScreen(
     modifier: Modifier = Modifier, 
     maxClient: MaxClient,
     onFileSelected: (Uri) -> Unit,
-    onShowSettings: () -> Unit
+    onShowSettings: () -> Unit,
+    onGoToAuth: () -> Unit = {}
 ) {
     val coroutineScope = rememberCoroutineScope()
     var musicList by remember { mutableStateOf<List<MusicMessage>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val prefs = getEncryptedMaxmusicPrefs(context)
+    val sessionPrefs = getSessionPrefs(context)
     var showPasswordDialog by remember { mutableStateOf(!CryptoManager.isPasswordSet) }
     var rutubeResults by remember { mutableStateOf<List<RutubeExtractor.RutubeVideo>>(emptyList()) }
     var isRutubeSearching by remember { mutableStateOf(false) }
     var selectedRutubeVideo by remember { mutableStateOf<RutubeExtractor.RutubeVideo?>(null) }
     var showRutubeOptionsDialog by remember { mutableStateOf(false) }
+    var showMaxAuthPrompt by remember { mutableStateOf(false) }
 
     if (showRutubeOptionsDialog && selectedRutubeVideo != null) {
         val video = selectedRutubeVideo!!
@@ -195,11 +198,27 @@ fun MusicListScreen(
         )
     }
 
+    if (showMaxAuthPrompt) {
+        AlertDialog(
+            onDismissRequest = { showMaxAuthPrompt = false },
+            title = { Text("Требуется вход") },
+            text = { Text("Похоже вы хотите загрузить свои треки. Войдите через национальный мессенджер макс, чтобы ваши треки сохранялись в избранном.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showMaxAuthPrompt = false
+                    onGoToAuth()
+                }) { Text("Войти") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showMaxAuthPrompt = false }) { Text("Отмена") }
+            }
+        )
+    }
     if (showPasswordDialog) {
         var pwd by remember { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { /* don't allow dismiss */ },
-            title = { Text(if (prefs.getString("auth_token", null) != null) "С обновлением ZMusic!" else "Добро пожаловать в ZMusic") },
+            title = { Text(if (sessionPrefs.getString("auth_token", null) != null) "С обновлением ZMusic!" else "Добро пожаловать в ZMusic") },
             text = {
                 Column {
                     Text("Для обеспечения безопасности ваших треков, придумайте или введите пароль для шифрования (сохраните его в Google Паролях или другом менеджере). Он будет использоваться локально.")

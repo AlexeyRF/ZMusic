@@ -71,6 +71,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
+fun getSessionPrefs(context: Context): android.content.SharedPreferences {
+    val masterKey = MasterKey.Builder(context)
+        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+        .build()
+    return EncryptedSharedPreferences.create(
+        context,
+        "session_prefs",
+        masterKey,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+}
+
 fun getEncryptedMaxmusicPrefs(context: Context): android.content.SharedPreferences {
     val masterKey = MasterKey.Builder(context)
         .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -100,6 +113,14 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         CryptoManager.init(this)
+        val oldPrefs = getEncryptedMaxmusicPrefs(this)
+        val sessionPrefs = getSessionPrefs(this)
+        val oldToken = oldPrefs.getString("auth_token", null)
+        if (oldToken != null) {
+            sessionPrefs.edit().putString("auth_token", oldToken).apply()
+            oldPrefs.edit().remove("auth_token").apply()
+        }
+        maxClient.context = this
         AudioCacheManager.init(this)
         VibeManager.init(this)
         enableEdgeToEdge()
@@ -118,6 +139,7 @@ class MainActivity : ComponentActivity() {
 
             ZMusicTheme(dynamicColor = useMaterial) {
                 var currentScreen by remember { mutableStateOf(Screen.Auth) }
+                var isStartupAuth by remember { mutableStateOf(true) }
 
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     when (currentScreen) {
@@ -125,6 +147,7 @@ class MainActivity : ComponentActivity() {
                             AuthScreen(
                                 modifier = Modifier.padding(innerPadding),
                                 maxClient = maxClient,
+                                isStartup = isStartupAuth,
                                 onAuthSuccess = { currentScreen = Screen.MusicList }
                             )
                         }
@@ -133,7 +156,11 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier,
                                 maxClient = maxClient,
                                 onFileSelected = {},
-                                onShowSettings = { currentScreen = Screen.Settings }
+                                onShowSettings = { currentScreen = Screen.Settings },
+                                onGoToAuth = { 
+                                    isStartupAuth = false
+                                    currentScreen = Screen.Auth 
+                                }
                             )
                         }
                         Screen.Settings -> {
@@ -160,7 +187,7 @@ enum class Screen {
 }
 
 @Composable
-fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSuccess: () -> Unit) {
+fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, isStartup: Boolean = true, onAuthSuccess: () -> Unit) {
     val coroutineScope = rememberCoroutineScope()
     var step by remember { mutableStateOf(AuthStep.Loading) }
     
@@ -171,9 +198,10 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
 
     val context = LocalContext.current
     val prefs = getEncryptedMaxmusicPrefs(context)
+    val sessionPrefs = getSessionPrefs(context)
 
     LaunchedEffect(Unit) {
-        val savedToken = prefs.getString("auth_token", null)
+        val savedToken = sessionPrefs.getString("auth_token", null)
         if (savedToken != null) {
             maxClient.authToken = savedToken
             Logger.log("Найдена сохраненная сессия. Подключение...")
@@ -186,7 +214,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                 step = AuthStep.Phone
             }
         } else {
-            step = AuthStep.Phone
+            if (isStartup) onAuthSuccess() else step = AuthStep.Phone
         }
     }
 
@@ -265,7 +293,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                                     step = AuthStep.Password
                                 } else {
                                     Logger.log("Успешный вход!")
-                                    prefs.edit().putString("auth_token", maxClient.authToken).apply()
+                                    sessionPrefs.edit().putString("auth_token", maxClient.authToken).apply()
                                     onAuthSuccess()
                                 }
                             } catch (e: Exception) {
@@ -333,7 +361,7 @@ fun AuthScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onAuthSucces
                                 val success = maxClient.sendPassword(password)
                                 if (success) {
                                     Logger.log("Успешный вход!")
-                                    prefs.edit().putString("auth_token", maxClient.authToken).apply()
+                                    sessionPrefs.edit().putString("auth_token", maxClient.authToken).apply()
                                     context.getSystemService(android.view.autofill.AutofillManager::class.java)?.commit()
                                     onAuthSuccess()
                                 } else {
