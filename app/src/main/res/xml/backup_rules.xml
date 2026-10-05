@@ -1,5 +1,6 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
-    <exclude domain="sharedpref" path="maxmusic_prefs.xml" />
-    <exclude domain="sharedpref" path="crypto_prefs.xml" />
+    <include domain="sharedpref" path="." />
+    <include domain="file" path="local_tracks" />
+    <exclude domain="sharedpref" path="session_prefs.xml" />
 </full-backup-content>

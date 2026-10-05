@@ -29,6 +29,7 @@ fun MetadataEditorDialog(
     initialPlaylists: Set<String>,
     allPlaylists: List<String>,
     showEncryptionOption: Boolean = true,
+    onDownloadToMax: (() -> Unit)? = null,
     onDismiss: () -> Unit,
     onSave: (String, String, Bitmap?, Boolean, Set<String>) -> Unit
 ) {
@@ -120,6 +121,13 @@ fun MetadataEditorDialog(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = useZ2, onCheckedChange = { useZ2 = it })
                         Text("Шифровать метаданные (.z2)")
+                    }
+                }
+                
+                if (onDownloadToMax != null) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = onDownloadToMax, modifier = Modifier.fillMaxWidth()) {
+                        Text("Скачать на сервер MAX")
                     }
                 }
             }

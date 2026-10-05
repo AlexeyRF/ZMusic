@@ -206,7 +206,10 @@ object AudioPlayer {
                             val videoId = json.optString("id")
                             val streamUrl = RutubeExtractor.getPlayUrl(videoId)
                             if (streamUrl != null) {
-                                playUrl(context, streamUrl, fallbackName, track.fileId, "m3u8")
+                                val title = json.optString("title")
+                                val author = json.optString("author")
+                                val displayName = if (author.isNotEmpty() && title.isNotEmpty()) "$author - $title" else fallbackName
+                                playUrl(context, streamUrl, displayName, track.fileId, "m3u8")
                                 val thumbUrl = json.optString("thumbnail")
                                 if (thumbUrl.isNotEmpty()) {
                                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -214,15 +217,21 @@ object AudioPlayer {
                                             val thumbBytes = java.net.URL(thumbUrl).readBytes()
                                             val bmp = android.graphics.BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
                                             currentAlbumArt.value = bmp
+                                            MusicItemCache.cache[track.fileId] = MusicItemCache.ItemMeta(
+                                                title = title,
+                                                artist = author,
+                                                albumArt = bmp
+                                            )
+                                            updateService(context)
                                         } catch(e: Exception) {}
                                     }
                                 }
                             } else {
-                                Logger.log("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РїРѕС‚РѕРє Rutube")
+                                Logger.log("Р СњР Вµ РЎС“Р Т‘Р В°Р В»Р С•РЎРѓРЎРЉ Р С—Р С•Р В»РЎС“РЎвЂЎР С‘РЎвЂљРЎРЉ Р С—Р С•РЎвЂљР С•Р С” Rutube")
                                 next()
                             }
                         } catch (e: Exception) {
-                            Logger.log("РћС€РёР±РєР° С‡С‚РµРЅРёСЏ Rutube СЃСЃС‹Р»РєРё")
+                            Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° РЎвЂЎРЎвЂљР ВµР Р…Р С‘РЎРЏ Rutube РЎРѓРЎРѓРЎвЂ№Р В»Р С”Р С‘")
                             next()
                         }
                     } else {
@@ -245,7 +254,7 @@ object AudioPlayer {
                     }
                 }
             } catch (e: Exception) {
-                Logger.log("РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё С‚СЂРµРєР°: ${e.localizedMessage}")
+                Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° Р В·Р В°Р С–РЎР‚РЎС“Р В·Р С”Р С‘ РЎвЂљРЎР‚Р ВµР С”Р В°: ${e.localizedMessage}")
             }
         }
     }
@@ -425,14 +434,14 @@ object AudioPlayer {
                         try {
                             art = BitmapFactory.decodeByteArray(artBytes, 0, artBytes.size)
                         } catch (t: Throwable) {
-                            Logger.log("РћС€РёР±РєР° РґРµРєРѕРґРёСЂРѕРІР°РЅРёСЏ РѕР±Р»РѕР¶РєРё (OOM?): ${t.message}")
+                            Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° Р Т‘Р ВµР С”Р С•Р Т‘Р С‘РЎР‚Р С•Р Р†Р В°Р Р…Р С‘РЎРЏ Р С•Р В±Р В»Р С•Р В¶Р С”Р С‘ (OOM?): ${t.message}")
                         }
                     }
                 }
                 return TrackMetadata(title, artist, art)
             }
         } catch (t: Throwable) {
-            Logger.log("РћС€РёР±РєР° РёР·РІР»РµС‡РµРЅРёСЏ РјРµС‚Р°РґР°РЅРЅС‹С… (Jaudiotagger): ${t.message}")
+            Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° Р С‘Р В·Р Р†Р В»Р ВµРЎвЂЎР ВµР Р…Р С‘РЎРЏ Р СР ВµРЎвЂљР В°Р Т‘Р В°Р Р…Р Р…РЎвЂ№РЎвЂ¦ (Jaudiotagger): ${t.message}")
         } finally {
             tempFile?.delete()
         }
@@ -504,7 +513,7 @@ object AudioPlayer {
                     true
                 }
                 setOnPreparedListener { mp ->
-                    Logger.log("РџР»РµРµСЂ РіРѕС‚РѕРІ Рє РІРѕСЃРїСЂРѕРёР·РІРµРґРµРЅРёСЋ: $trackName")
+                    Logger.log("Р СџР В»Р ВµР ВµРЎР‚ Р С–Р С•РЎвЂљР С•Р Р† Р С” Р Р†Р С•РЎРѓР С—РЎР‚Р С•Р С‘Р В·Р Р†Р ВµР Т‘Р ВµР Р…Р С‘РЎР‹: $trackName")
                     applyEffects()
                     mp.start() 
                     isPlayingState.value = true
@@ -534,7 +543,7 @@ object AudioPlayer {
                     }
                 }
                 setOnErrorListener { _, what, extra ->
-                    Logger.log("РћС€РёР±РєР° MediaPlayer: what=$what extra=$extra")
+                    Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° MediaPlayer: what=$what extra=$extra")
                     isPlayingState.value = false
                     progressJob?.cancel()
                     context?.let { updateService(it) }
@@ -542,7 +551,7 @@ object AudioPlayer {
                 }
             }
         } catch (t: Throwable) {
-            Logger.log("РћС€РёР±РєР° РёРЅРёС†РёР°Р»РёР·Р°С†РёРё РїР»РµРµСЂР°: ${t.message}")
+            Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° Р С‘Р Р…Р С‘РЎвЂ Р С‘Р В°Р В»Р С‘Р В·Р В°РЎвЂ Р С‘Р С‘ Р С—Р В»Р ВµР ВµРЎР‚Р В°: ${t.message}")
         }
     }
     
@@ -672,7 +681,7 @@ object AudioPlayer {
                         setStrength(1000)
                     }
                 } catch (e: Exception) {
-                    Logger.log("BassBoost РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚СЃСЏ")
+                    Logger.log("BassBoost Р Р…Р Вµ Р С—Р С•Р Т‘Р Т‘Р ВµРЎР‚Р В¶Р С‘Р Р†Р В°Р ВµРЎвЂљРЎРѓРЎРЏ")
                 }
             }
 
@@ -702,10 +711,10 @@ object AudioPlayer {
                     }
                 }
             } catch (e: Exception) {
-                Logger.log("Equalizer РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚СЃСЏ")
+                Logger.log("Equalizer Р Р…Р Вµ Р С—Р С•Р Т‘Р Т‘Р ВµРЎР‚Р В¶Р С‘Р Р†Р В°Р ВµРЎвЂљРЎРѓРЎРЏ")
             }
         } catch (e: Exception) {
-            Logger.log("РћС€РёР±РєР° СЌС„С„РµРєС‚РѕРІ: ${e.message}")
+            Logger.log("Р С›РЎв‚¬Р С‘Р В±Р С”Р В° РЎРЊРЎвЂћРЎвЂћР ВµР С”РЎвЂљР С•Р Р†: ${e.message}")
         }
         
         appContext?.let { updateService(it) }
@@ -806,3 +815,4 @@ object AudioPlayer {
         }
     }
 }
+

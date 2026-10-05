@@ -1,11 +1,13 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <exclude domain="sharedpref" path="maxmusic_prefs.xml" />
-        <exclude domain="sharedpref" path="crypto_prefs.xml" />
+        <include domain="sharedpref" path="." />
+        <include domain="file" path="local_tracks" />
+        <exclude domain="sharedpref" path="session_prefs.xml" />
     </cloud-backup>
     <device-transfer>
-        <exclude domain="sharedpref" path="maxmusic_prefs.xml" />
-        <exclude domain="sharedpref" path="crypto_prefs.xml" />
+        <include domain="sharedpref" path="." />
+        <include domain="file" path="local_tracks" />
+        <exclude domain="sharedpref" path="session_prefs.xml" />
     </device-transfer>
 </data-extraction-rules>
