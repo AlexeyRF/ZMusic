@@ -110,6 +110,90 @@ fun MusicListScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
     val prefs = getEncryptedMaxmusicPrefs(context)
     var showPasswordDialog by remember { mutableStateOf(!CryptoManager.isPasswordSet) }
+    var rutubeResults by remember { mutableStateOf<List<RutubeExtractor.RutubeVideo>>(emptyList()) }
+    var isRutubeSearching by remember { mutableStateOf(false) }
+    var selectedRutubeVideo by remember { mutableStateOf<RutubeExtractor.RutubeVideo?>(null) }
+    var showRutubeOptionsDialog by remember { mutableStateOf(false) }
+
+    if (showRutubeOptionsDialog && selectedRutubeVideo != null) {
+        val video = selectedRutubeVideo!!
+        AlertDialog(
+            onDismissRequest = { showRutubeOptionsDialog = false },
+            title = { Text(video.title) },
+            text = {
+                Column {
+                    Text("Выберите действие:")
+                    Spacer(Modifier.height(16.dp))
+                    Button(onClick = {
+                        showRutubeOptionsDialog = false
+                        coroutineScope.launch {
+                            val streamUrl = RutubeExtractor.getPlayUrl(video.id)
+                            if (streamUrl != null) {
+                                AudioPlayer.playUrl(context, streamUrl, video.title, -1L, "m3u8")
+                                if (video.thumbnailUrl.isNotEmpty()) {
+                                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                        try {
+                                            val thumbBytes = java.net.URL(video.thumbnailUrl).readBytes()
+                                            val bmp = android.graphics.BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                            AudioPlayer.currentAlbumArt.value = bmp
+                                        } catch(e: Exception) {}
+                                    }
+                                }
+                            } else {
+                                android.widget.Toast.makeText(context, "Ошибка", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Слушать без сохранения") }
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = {
+                        showRutubeOptionsDialog = false
+                        coroutineScope.launch {
+                            isLoading = true
+                            try {
+                                val json = org.json.JSONObject()
+                                json.put("type", "rutube")
+                                json.put("id", video.id)
+                                json.put("title", video.title)
+                                json.put("author", video.author)
+                                json.put("thumbnail", video.thumbnailUrl)
+                                val bytes = json.toString().toByteArray(Charsets.UTF_8)
+                                val filename = "${video.title.replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "_")}.rutube.zconfig"
+                                val success = maxClient.sendMusic(filename, bytes)
+                                if (success) {
+                                    kotlinx.coroutines.delay(1000)
+                                    musicList = maxClient.getSavedMusic().filter { ((!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                                }
+                            } catch (e: Exception) {}
+                            isLoading = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Добавить как ссылку") }
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = {
+                        showRutubeOptionsDialog = false
+                        coroutineScope.launch {
+                            isLoading = true
+                            try {
+                                val tempFile = java.io.File(context.cacheDir, "rutube_temp.ts")
+                                val success = RutubeExtractor.downloadVideo(video.id, tempFile) { }
+                                if (success) {
+                                    val bytes = tempFile.readBytes()
+                                    val filename = "${video.author} - ${video.title}.ts".replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                    val upSuccess = maxClient.sendMusic(filename, bytes)
+                                    if (upSuccess) {
+                                        kotlinx.coroutines.delay(1000)
+                                        musicList = maxClient.getSavedMusic().filter { ((!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                                    }
+                                }
+                                tempFile.delete()
+                            } catch (e: Exception) {}
+                            isLoading = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Скачать в библиотеку") }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showRutubeOptionsDialog = false }) { Text("Отмена") } }
+        )
+    }
 
     if (showPasswordDialog) {
         var pwd by remember { mutableStateOf("") }
@@ -260,7 +344,7 @@ fun MusicListScreen(
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         val msg = if (skippedCount > 0) "Загружено: $uploadedCount, пропущено дубликатов: $skippedCount" else "Загружено треков: $uploadedCount"
                         android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
-                        musicList = maxClient.getSavedMusic().filter { !it.filename.contains(".zconfig") }
+                        musicList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
                         
                         if (useZ2) {
                             for (track in musicList) {
@@ -459,7 +543,7 @@ fun MusicListScreen(
                         if (success) {
                             Logger.log("Успешно загружен трек: $finalFileName")
                             kotlinx.coroutines.delay(1500)
-                            val newList = maxClient.getSavedMusic().filter { !it.filename.contains(".zconfig") }
+                            val newList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
                             val newTrack = newList.find { it.filename == finalFileName }
                             if (newTrack != null) {
                                 val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
@@ -498,11 +582,11 @@ fun MusicListScreen(
             permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
         try {
-            musicList = maxClient.getSavedMusic().filter { !it.filename.contains(".zconfig") }
+            musicList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
             
             val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
             if (!prefs.getBoolean("config_auto_loaded", false)) {
-                val configTracks = maxClient.getSavedMusic().filter { it.filename.contains(".zconfig") }
+                val configTracks = maxClient.getSavedMusic().filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }
                 if (configTracks.isNotEmpty()) {
                     val latestGroup = configTracks.groupBy { it.filename.substringBefore(".part") }.maxByOrNull { it.key }
                     if (latestGroup != null) {
@@ -816,6 +900,12 @@ fun MusicListScreen(
             },
             confirmButton = {
                 TextButton(onClick = { showManagePlaylistsDialog = false }) { Text("Закрыть") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showManagePlaylistsDialog = false
+                    showCreatePlaylistDialog = true
+                }) { Text("Создать") }
             }
         )
     }
@@ -910,7 +1000,7 @@ fun MusicListScreen(
                         title = {
                             OutlinedTextField(
                                 value = searchQuery,
-                                onValueChange = { searchQuery = it },
+                                onValueChange = { searchQuery = it; rutubeResults = emptyList() },
                                 placeholder = { Text("Поиск треков...") },
                                 singleLine = true,
                                 trailingIcon = {
@@ -936,9 +1026,6 @@ fun MusicListScreen(
                         actions = {
                             IconButton(onClick = { isSearchActive = true }) {
                                 Icon(Icons.Filled.Search, contentDescription = "Поиск")
-                            }
-                            IconButton(onClick = { showCreatePlaylistDialog = true }) {
-                                Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = "Create Playlist")
                             }
                             IconButton(onClick = {
                                 VibeManager.isVibeModeEnabled.value = !VibeManager.isVibeModeEnabled.value
@@ -1328,6 +1415,45 @@ fun MusicListScreen(
                                 }
                             )
                         }
+                        if (searchQuery.isNotBlank() && displayList.size < 10 && !isRutubeSearching) {
+                            item {
+                                TextButton(
+                                    onClick = { 
+                                        isRutubeSearching = true
+                                        coroutineScope.launch {
+                                            rutubeResults = RutubeExtractor.search(searchQuery)
+                                            isRutubeSearching = false
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth().padding(16.dp)
+                                ) {
+                                    Text("Не нашли нужное? Искать на Rutube")
+                                }
+                            }
+                        }
+                        if (isRutubeSearching) {
+                            item {
+                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                    CircularProgressIndicator()
+                                }
+                            }
+                        }
+                        if (rutubeResults.isNotEmpty()) {
+                            item {
+                                Text("Результаты Rutube", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+                            }
+                            items(rutubeResults, key = { it.id }) { video ->
+                                ListItem(
+                                    headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                    supportingContent = { Text(video.author) },
+                                    modifier = Modifier.clickable {
+                                        selectedRutubeVideo = video
+                                        showRutubeOptionsDialog = true
+                                    }
+                                )
+                                HorizontalDivider()
+                            }
+                        }
                     }
                 }
                 
@@ -1584,7 +1710,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
     LaunchedEffect(Unit) {
         try {
             val allTracks = maxClient.getSavedMusic()
-            serverConfigs = allTracks.filter { it.filename.contains(".zconfig") }.sortedByDescending { it.filename }
+            serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
@@ -1740,7 +1866,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
                             if (allOk) {
                                 android.widget.Toast.makeText(context, "Успешно выгружено!", android.widget.Toast.LENGTH_LONG).show()
                                 val allTracks = maxClient.getSavedMusic()
-                                serverConfigs = allTracks.filter { it.filename.contains(".zconfig") }.sortedByDescending { it.filename }
+                                serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
                             } else {
                                 android.widget.Toast.makeText(context, "Ошибка выгрузки", android.widget.Toast.LENGTH_LONG).show()
                             }
@@ -1800,7 +1926,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
                                                 maxClient.deleteTrack(partTrack.messageId)
                                             }
                                             val allTracks = maxClient.getSavedMusic()
-                                            serverConfigs = allTracks.filter { it.filename.contains(".zconfig") }.sortedByDescending { it.filename }
+                                            serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
                                         }
                                     }) {
                                         Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)

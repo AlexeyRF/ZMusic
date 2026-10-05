@@ -1,4 +1,4 @@
-package ru.alexeyrf.maxmusic
+﻿package ru.alexeyrf.maxmusic
 
 import android.net.Uri
 import android.os.Bundle
@@ -200,7 +200,34 @@ object AudioPlayer {
                         if (!track.serverArtist.isNullOrBlank()) "${track.serverArtist} - ${track.serverTitle}" else track.serverTitle
                     } else track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
                     val ext = track.filename.substringAfterLast('.', "mp3").lowercase()
-                    playUrl(context, file.absolutePath, fallbackName, track.fileId, ext)
+                    if (track.filename.endsWith(".rutube.zconfig")) {
+                        try {
+                            val json = org.json.JSONObject(file.readText())
+                            val videoId = json.optString("id")
+                            val streamUrl = RutubeExtractor.getPlayUrl(videoId)
+                            if (streamUrl != null) {
+                                playUrl(context, streamUrl, fallbackName, track.fileId, "m3u8")
+                                val thumbUrl = json.optString("thumbnail")
+                                if (thumbUrl.isNotEmpty()) {
+                                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                                        try {
+                                            val thumbBytes = java.net.URL(thumbUrl).readBytes()
+                                            val bmp = android.graphics.BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                            currentAlbumArt.value = bmp
+                                        } catch(e: Exception) {}
+                                    }
+                                }
+                            } else {
+                                Logger.log("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РїРѕС‚РѕРє Rutube")
+                                next()
+                            }
+                        } catch (e: Exception) {
+                            Logger.log("РћС€РёР±РєР° С‡С‚РµРЅРёСЏ Rutube СЃСЃС‹Р»РєРё")
+                            next()
+                        }
+                    } else {
+                        playUrl(context, file.absolutePath, fallbackName, track.fileId, ext)
+                    }
                 }
                 
                 // Prefetch next track if sequential
@@ -218,7 +245,7 @@ object AudioPlayer {
                     }
                 }
             } catch (e: Exception) {
-                Logger.log("Ошибка загрузки трека: ${e.localizedMessage}")
+                Logger.log("РћС€РёР±РєР° Р·Р°РіСЂСѓР·РєРё С‚СЂРµРєР°: ${e.localizedMessage}")
             }
         }
     }
@@ -236,11 +263,11 @@ object AudioPlayer {
                 if (isPlayingState.value) reverbMediaPlayer?.start()
             } else {
                 reverbMediaPlayer?.pause()
+                reverbMediaPlayer?.seekTo(0)
                 if (isPlayingState.value) {
-                    reverbJob = CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-                        kotlinx.coroutines.delay(-targetPos.toLong())
-                        reverbMediaPlayer?.seekTo(0)
-                        reverbMediaPlayer?.start()
+                    reverbJob = CoroutineScope(Dispatchers.Main).launch {
+                        kotlinx.coroutines.delay((-targetPos).toLong())
+                        if (isPlayingState.value) reverbMediaPlayer?.start()
                     }
                 }
             }
@@ -398,14 +425,14 @@ object AudioPlayer {
                         try {
                             art = BitmapFactory.decodeByteArray(artBytes, 0, artBytes.size)
                         } catch (t: Throwable) {
-                            Logger.log("Ошибка декодирования обложки (OOM?): ${t.message}")
+                            Logger.log("РћС€РёР±РєР° РґРµРєРѕРґРёСЂРѕРІР°РЅРёСЏ РѕР±Р»РѕР¶РєРё (OOM?): ${t.message}")
                         }
                     }
                 }
                 return TrackMetadata(title, artist, art)
             }
         } catch (t: Throwable) {
-            Logger.log("Ошибка извлечения метаданных (Jaudiotagger): ${t.message}")
+            Logger.log("РћС€РёР±РєР° РёР·РІР»РµС‡РµРЅРёСЏ РјРµС‚Р°РґР°РЅРЅС‹С… (Jaudiotagger): ${t.message}")
         } finally {
             tempFile?.delete()
         }
@@ -477,7 +504,7 @@ object AudioPlayer {
                     true
                 }
                 setOnPreparedListener { mp ->
-                    Logger.log("Плеер готов к воспроизведению: $trackName")
+                    Logger.log("РџР»РµРµСЂ РіРѕС‚РѕРІ Рє РІРѕСЃРїСЂРѕРёР·РІРµРґРµРЅРёСЋ: $trackName")
                     applyEffects()
                     mp.start() 
                     isPlayingState.value = true
@@ -507,7 +534,7 @@ object AudioPlayer {
                     }
                 }
                 setOnErrorListener { _, what, extra ->
-                    Logger.log("Ошибка MediaPlayer: what=$what extra=$extra")
+                    Logger.log("РћС€РёР±РєР° MediaPlayer: what=$what extra=$extra")
                     isPlayingState.value = false
                     progressJob?.cancel()
                     context?.let { updateService(it) }
@@ -515,7 +542,7 @@ object AudioPlayer {
                 }
             }
         } catch (t: Throwable) {
-            Logger.log("Ошибка инициализации плеера: ${t.message}")
+            Logger.log("РћС€РёР±РєР° РёРЅРёС†РёР°Р»РёР·Р°С†РёРё РїР»РµРµСЂР°: ${t.message}")
         }
     }
     
@@ -537,14 +564,16 @@ object AudioPlayer {
         if (delay != null && delay > 0 && reverbMediaPlayer != null) {
             val effectiveDelay = (delay / currentSpeed).toInt()
             val targetPos = (mediaPlayer?.currentPosition ?: 0) - effectiveDelay
+            reverbJob?.cancel()
             if (targetPos > 0) {
-                reverbMediaPlayer?.seekTo(targetPos)
+                // To avoid desync when resuming, don't re-seek, just start it if it was paused
                 reverbMediaPlayer?.start()
             } else {
-                reverbJob?.cancel()
-                reverbJob = CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                reverbMediaPlayer?.pause()
+                reverbMediaPlayer?.seekTo(0)
+                reverbJob = CoroutineScope(Dispatchers.Main).launch {
                     kotlinx.coroutines.delay(-targetPos.toLong())
-                    reverbMediaPlayer?.start()
+                    if (isPlayingState.value) reverbMediaPlayer?.start()
                 }
             }
         }
@@ -643,7 +672,7 @@ object AudioPlayer {
                         setStrength(1000)
                     }
                 } catch (e: Exception) {
-                    Logger.log("BassBoost не поддерживается")
+                    Logger.log("BassBoost РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚СЃСЏ")
                 }
             }
 
@@ -673,10 +702,10 @@ object AudioPlayer {
                     }
                 }
             } catch (e: Exception) {
-                Logger.log("Equalizer не поддерживается")
+                Logger.log("Equalizer РЅРµ РїРѕРґРґРµСЂР¶РёРІР°РµС‚СЃСЏ")
             }
         } catch (e: Exception) {
-            Logger.log("Ошибка эффектов: ${e.message}")
+            Logger.log("РћС€РёР±РєР° СЌС„С„РµРєС‚РѕРІ: ${e.message}")
         }
         
         appContext?.let { updateService(it) }
