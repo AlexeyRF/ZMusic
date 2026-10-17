@@ -204,10 +204,10 @@ object AudioCacheManager {
             var artist = entry.artist
 
             if (title.isNullOrBlank()) {
-                title = LocalMetadataManager.getTitle(ctx, k)
+                title = LocalMetadataManager.getTitle(ctx, k, name)
             }
             if (artist.isNullOrBlank()) {
-                artist = LocalMetadataManager.getArtist(ctx, k)
+                artist = LocalMetadataManager.getArtist(ctx, k, name)
             }
 
             // If audio file is encrypted, try decrypting it

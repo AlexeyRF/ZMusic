@@ -16,3 +16,4 @@ local.properties
 /app/release/app-release.apk
 /output.txt
 *.py
+/.kotlin/errors/

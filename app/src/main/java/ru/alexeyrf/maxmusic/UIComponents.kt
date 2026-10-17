@@ -291,7 +291,7 @@ fun MusicListScreen(
                                         .replace(Regex("[\\\\/:*?\"<>|]"), "_")
                                     val fileName = "$safeBaseName.m4a"
 
-                                    val fileId = (video.id.hashCode().toLong() and 0x7FFFFFFFFFFFFFFFL).let { if (it <= 0L) System.currentTimeMillis() else it }
+                                    val fileId = fileName.hashCode().toLong().let { if (it == 0L) 1L else kotlin.math.abs(it) }
                                     val messageId = System.currentTimeMillis()
 
                                     val localDir = java.io.File(context.filesDir, "local_tracks")
@@ -302,9 +302,9 @@ fun MusicListScreen(
                                     val cacheFile = java.io.File(context.cacheDir, "track_${fileId}.audio")
                                     cacheFile.writeBytes(rawBytes)
 
-                                    LocalMetadataManager.saveTitle(context, fileId, cleanTitle)
+                                    LocalMetadataManager.saveTitle(context, fileId, cleanTitle, fileName)
                                     if (cleanAuthor.isNotEmpty()) {
-                                        LocalMetadataManager.saveArtist(context, fileId, cleanAuthor)
+                                        LocalMetadataManager.saveArtist(context, fileId, cleanAuthor, fileName)
                                     }
                                     if (video.thumbnailUrl.isNotEmpty()) {
                                         try {
@@ -314,7 +314,7 @@ fun MusicListScreen(
                                             }
                                             val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
                                             if (bmp != null) {
-                                                LocalMetadataManager.saveCover(context, fileId, bmp)
+                                                LocalMetadataManager.saveCover(context, fileId, bmp, fileName)
                                             }
                                         } catch (e: Exception) {}
                                     }
@@ -381,15 +381,18 @@ fun MusicListScreen(
                                     if (upSuccess) {
                                         kotlinx.coroutines.delay(1000)
                                         val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
-                                        val newTrack = newList.find { it.filename == finalFileName }
+                                        val newTrack = newList.find { 
+                                            it.filename.equals(finalFileName, ignoreCase = true) || 
+                                            LocalMetadataManager.normalizeFileName(it.filename).equals(LocalMetadataManager.normalizeFileName(finalFileName), ignoreCase = true)
+                                        }
                                         if (newTrack != null) {
                                             val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
                                             cacheFile.writeBytes(rawBytes) // Cache decrypted audio
                                             AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, cleanTitle, cleanAuthor)
                                             
-                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, cleanTitle)
+                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, cleanTitle, newTrack.filename)
                                             if (cleanAuthor.isNotEmpty()) {
-                                                LocalMetadataManager.saveArtist(context, newTrack.fileId, cleanAuthor)
+                                                LocalMetadataManager.saveArtist(context, newTrack.fileId, cleanAuthor, newTrack.filename)
                                             }
                                             if (video.thumbnailUrl.isNotEmpty()) {
                                                 try {
@@ -399,7 +402,7 @@ fun MusicListScreen(
                                                     }
                                                     val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
                                                     if (bmp != null) {
-                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
+                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp, newTrack.filename)
                                                     }
                                                 } catch (e: Exception) {}
                                             }
@@ -1660,10 +1663,24 @@ fun MusicListScreen(
                 }
                 
                 val uniqueDisplayList = remember(displayList) {
-                    displayList.distinctBy { track ->
-                        val keyPart = if (track.messageId != 0L) track.messageId else track.fileId
-                        "${keyPart}_${track.fileId}_${track.filename}"
+                    val map = mutableMapOf<String, ru.alexeyrf.maxmusic.client.MusicMessage>()
+                    for (track in displayList) {
+                        val norm = LocalMetadataManager.normalizeFileName(track.filename).lowercase()
+                        val key = norm.ifBlank { "id_${track.fileId}" }
+                        val existing = map[key]
+                        if (existing == null) {
+                            map[key] = track
+                        } else {
+                            val existingTitle = LocalMetadataManager.getTitle(context, existing.fileId, existing.filename) ?: existing.serverTitle
+                            val newTitle = LocalMetadataManager.getTitle(context, track.fileId, track.filename) ?: track.serverTitle
+                            val existingHasMeta = !existingTitle.isNullOrBlank()
+                            val newHasMeta = !newTitle.isNullOrBlank()
+                            if (!existingHasMeta && newHasMeta) {
+                                map[key] = track
+                            }
+                        }
                     }
+                    map.values.toList().distinctBy { it.fileId }
                 }
                 
                 if (uniqueDisplayList.isEmpty() && (!isSearchActive || searchQuery.isBlank())) {
@@ -1862,8 +1879,8 @@ fun MusicItem(
 ) {
     val context = LocalContext.current
     val cached = MusicItemCache.cache[track.fileId]
-    val localTitle = LocalMetadataManager.getTitle(context, track.fileId)
-    val localArtist = LocalMetadataManager.getArtist(context, track.fileId)
+    val localTitle = LocalMetadataManager.getTitle(context, track.fileId, track.filename)
+    val localArtist = LocalMetadataManager.getArtist(context, track.fileId, track.filename)
     val rawCleanTitle = when {
         track.filename.endsWith(".rutube.zconfig") -> track.filename.removeSuffix(".rutube.zconfig").replace('_', ' ')
         track.filename.endsWith(".youtube.zconfig") -> track.filename.removeSuffix(".youtube.zconfig").replace('_', ' ')
@@ -1877,7 +1894,7 @@ fun MusicItem(
     val defaultTitle = track.serverTitle ?: localTitle ?: cleanTitle
     val title = cached?.title ?: defaultTitle
     val artist = cached?.artist ?: (localArtist ?: track.serverArtist)
-    val albumArt = cached?.albumArt ?: LocalMetadataManager.getCover(context, track.fileId)
+    val albumArt = cached?.albumArt ?: LocalMetadataManager.getCover(context, track.fileId, track.filename)
     
     LaunchedEffect(track.fileId) {
         if (cached == null || cached.title.startsWith("Cached Track") || cached.title.startsWith("Track ")) {
@@ -1909,11 +1926,11 @@ fun MusicItem(
                     }
                 }
                 
-                val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId)
+                val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId, track.filename)
                 if (overrideTitle != null) tempTitle = overrideTitle
-                val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId)
+                val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId, track.filename)
                 if (overrideArtist != null) tempArtist = overrideArtist
-                val overrideCover = LocalMetadataManager.getCover(context, track.fileId)
+                val overrideCover = LocalMetadataManager.getCover(context, track.fileId, track.filename)
                 if (overrideCover != null) tempArt = overrideCover
                 
                 MusicItemCache.cache[track.fileId] = MusicItemCache.ItemMeta(tempTitle, tempArtist, tempArt)
@@ -2375,7 +2392,7 @@ fun SettingsScreen(
                             tempReverb = it.toInt()
                             tempReverbStr = if (tempReverb > 0) tempReverb.toString() else ""
                             AudioPlayer.customReverbDelay.value = if (tempReverb > 0) tempReverb else null
-                            if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                            if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.applyEffects()
                         },
                         valueRange = 0f..500f,
                         modifier = Modifier.weight(1f)
@@ -2388,11 +2405,11 @@ fun SettingsScreen(
                             if (parsed != null) {
                                 tempReverb = parsed
                                 AudioPlayer.customReverbDelay.value = if (parsed > 0) parsed else null
-                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.applyEffects()
                             } else if (it.isEmpty()) {
                                 tempReverb = 0
                                 AudioPlayer.customReverbDelay.value = null
-                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.syncReverb()
+                                if (AudioPlayer.activeEffects.contains(AudioEffectType.REVERB)) AudioPlayer.applyEffects()
                             }
                         },
                         keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),

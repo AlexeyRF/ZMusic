@@ -39,6 +39,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import android.media.audiofx.BassBoost
 import android.media.audiofx.PresetReverb
+import android.media.audiofx.EnvironmentalReverb
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -175,8 +176,8 @@ object AudioPlayer {
     var historyIndex = -1
     val customSpeed = androidx.compose.runtime.mutableStateOf<Float?>(null)
     val customReverbDelay = androidx.compose.runtime.mutableStateOf<Int?>(null)
-    private var reverbMediaPlayer: android.media.MediaPlayer? = null
-    private var reverbJob: kotlinx.coroutines.Job? = null
+    private var envReverb: EnvironmentalReverb? = null
+    private var presetReverb: PresetReverb? = null
     private var lastUrl: String? = null
     
     var maxClient: ru.alexeyrf.maxmusic.client.MaxClient? = null
@@ -490,25 +491,6 @@ object AudioPlayer {
         cleanupTransition()
         mediaPlayer?.seekTo(positionMs)
         currentPosition.value = positionMs
-        val delay = customReverbDelay.value
-        if (delay != null && delay > 0 && reverbMediaPlayer != null) {
-            val effectiveDelay = (delay / currentSpeed).toInt()
-            val targetPos = positionMs - effectiveDelay
-            reverbJob?.cancel()
-            if (targetPos > 0) {
-                reverbMediaPlayer?.seekTo(targetPos)
-                if (isPlayingState.value) reverbMediaPlayer?.start()
-            } else {
-                reverbMediaPlayer?.pause()
-                reverbMediaPlayer?.seekTo(0)
-                if (isPlayingState.value) {
-                    reverbJob = CoroutineScope(Dispatchers.Main).launch {
-                        kotlinx.coroutines.delay((-targetPos).toLong())
-                        if (isPlayingState.value) reverbMediaPlayer?.start()
-                    }
-                }
-            }
-        }
         appContext?.let { updateService(it) }
     }
     
@@ -925,12 +907,9 @@ object AudioPlayer {
                 if (!isTransitioning) break
                 
                 val p = (step.toFloat() / steps).coerceIn(0f, 1f)
-                val angle = p * (Math.PI / 2.0)
-                
-                // Outgoing: equal power with crisp ducking to avoid bass clash
-                val volOut = (kotlin.math.cos(angle).toFloat() * (1.0f - p * 0.35f)).coerceIn(0f, 1f)
-                // Incoming: equal power fade in
-                val volIn = kotlin.math.sin(angle).toFloat().coerceIn(0f, 1f)
+                val s = p * p * (3f - 2f * p)
+                val volOut = (1.0f - s).coerceIn(0f, 1f)
+                val volIn = s.coerceIn(0f, 1f)
                 
                 try {
                     outgoing?.setVolume(volOut, volOut)
@@ -1144,7 +1123,6 @@ object AudioPlayer {
                         mp.setVolume(0f, 0f)
                         mp.start()
                         isPlayingState.value = true
-                        syncReverb()
                         AudioPlayer.duration.value = mp.duration
                         currentTrackStartTime = System.currentTimeMillis()
                         startCrossfadeAnimation(mp, fadingPlayer)
@@ -1152,7 +1130,6 @@ object AudioPlayer {
                         mp.setVolume(0f, 0f)
                         mp.start()
                         isPlayingState.value = true
-                        syncReverb()
                         AudioPlayer.duration.value = mp.duration
                         currentTrackStartTime = System.currentTimeMillis()
                         startFadeInAnimation(mp)
@@ -1160,7 +1137,6 @@ object AudioPlayer {
                         mp.setVolume(1f, 1f)
                         mp.start()
                         isPlayingState.value = true
-                        syncReverb()
                         AudioPlayer.duration.value = mp.duration
                         currentTrackStartTime = System.currentTimeMillis()
                     }
@@ -1200,8 +1176,6 @@ object AudioPlayer {
         if (mediaPlayer?.isPlaying == true) {
             mediaPlayer?.pause()
         }
-        reverbMediaPlayer?.pause()
-        reverbJob?.cancel()
         isPlayingState.value = false
         progressJob?.cancel()
         context?.let { updateService(it) }
@@ -1210,23 +1184,6 @@ object AudioPlayer {
     fun resume(context: Context? = null) {
         mediaPlayer?.start()
         isPlayingState.value = true
-        val delay = customReverbDelay.value
-        if (delay != null && delay > 0 && reverbMediaPlayer != null) {
-            val effectiveDelay = (delay / currentSpeed).toInt()
-            val targetPos = (mediaPlayer?.currentPosition ?: 0) - effectiveDelay
-            reverbJob?.cancel()
-            if (targetPos > 0) {
-                // To avoid desync when resuming, don't re-seek, just start it if it was paused
-                reverbMediaPlayer?.start()
-            } else {
-                reverbMediaPlayer?.pause()
-                reverbMediaPlayer?.seekTo(0)
-                reverbJob = CoroutineScope(Dispatchers.Main).launch {
-                    kotlinx.coroutines.delay(-targetPos.toLong())
-                    if (isPlayingState.value) reverbMediaPlayer?.start()
-                }
-            }
-        }
         startProgressTracker()
         context?.let { updateService(it) }
     }
@@ -1255,6 +1212,80 @@ object AudioPlayer {
         applyEffects()
     }
 
+    private fun releaseReverb() {
+        try {
+            envReverb?.enabled = false
+            envReverb?.release()
+        } catch (e: Exception) {}
+        envReverb = null
+        try {
+            presetReverb?.enabled = false
+            presetReverb?.release()
+        } catch (e: Exception) {}
+        presetReverb = null
+    }
+
+    private fun applyReverb(mp: MediaPlayer) {
+        if (envReverb != null || presetReverb != null) {
+            return
+        }
+        try {
+            val sessionId = mp.audioSessionId
+            if (sessionId == 0) return
+            
+            val activeCustomEffectName = activeCustomEffects.firstOrNull()
+            val customReverb = if (activeCustomEffectName != null && appContext != null) {
+                LocalMetadataManager.getCustomEffectReverb(appContext!!, activeCustomEffectName)
+            } else null
+            val delayMs = customReverb ?: (customReverbDelay.value ?: 150)
+            
+            try {
+                val env = EnvironmentalReverb(0, sessionId).apply {
+                    roomLevel = -1000
+                    roomHFLevel = -500
+                    decayTime = (delayMs * 12).coerceIn(1000, 5000)
+                    reflectionsLevel = -1200
+                    reflectionsDelay = (delayMs / 5).coerceIn(20, 100)
+                    reverbLevel = -200
+                    reverbDelay = (delayMs / 3).coerceIn(20, 100)
+                    diffusion = 1000
+                    density = 1000
+                    enabled = true
+                }
+                envReverb = env
+                Logger.log("EnvironmentalReverb успешно применен (sessionId=$sessionId)")
+                return
+            } catch (e: Exception) {
+                Logger.log("EnvironmentalReverb не поддерживается, пробуем PresetReverb: ${e.message}")
+            }
+            
+            try {
+                val preset = PresetReverb(0, sessionId).apply {
+                    preset = PresetReverb.PRESET_LARGEHALL
+                    enabled = true
+                }
+                presetReverb = preset
+                Logger.log("PresetReverb успешно применен (sessionId=$sessionId)")
+                return
+            } catch (e: Exception) {
+                try {
+                    val presetAux = PresetReverb(0, 0).apply {
+                        preset = PresetReverb.PRESET_LARGEHALL
+                        enabled = true
+                    }
+                    mp.attachAuxEffect(presetAux.id)
+                    mp.setAuxEffectSendLevel(0.7f)
+                    presetReverb = presetAux
+                    Logger.log("PresetReverb (aux) успешно применен")
+                } catch (e2: Exception) {
+                    Logger.log("Reverb не поддерживается устройством: ${e2.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            Logger.log("Ошибка инициализации Reverb: ${t.message}")
+        }
+    }
+
     fun applyEffects() {
         val mp = mediaPlayer ?: return
         
@@ -1281,37 +1312,44 @@ object AudioPlayer {
             currentSpeed = speed
 
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                mp.playbackParams = mp.playbackParams.apply {
-                    this.speed = speed
-                    this.pitch = pitch
-                }
-                if (!isPlayingState.value) mp.pause()
+                val currentParams = try { mp.playbackParams } catch (e: Exception) { null }
+                val speedDiff = if (currentParams != null) kotlin.math.abs(currentParams.speed - speed) else 1f
+                val pitchDiff = if (currentParams != null) kotlin.math.abs(currentParams.pitch - pitch) else 1f
                 
-                try {
-                    reverbMediaPlayer?.let { rmp ->
-                        rmp.playbackParams = rmp.playbackParams.apply {
+                // Only touch playbackParams if speed or pitch actually changed!
+                if (speedDiff > 0.01f || pitchDiff > 0.01f) {
+                    val isCurrentlyPlaying = isPlayingState.value && try { mp.isPlaying } catch (e: Exception) { false }
+                    if (!isCurrentlyPlaying) {
+                        try { mp.setVolume(0f, 0f) } catch (e: Exception) {}
+                    }
+                    try {
+                        mp.playbackParams = (currentParams ?: android.media.PlaybackParams()).apply {
                             this.speed = speed
                             this.pitch = pitch
                         }
-                        if (!isPlayingState.value) rmp.pause()
+                    } catch (e: Exception) {
+                        Logger.log("Ошибка setPlaybackParams: ${e.message}")
                     }
-                } catch (e: Exception) {}
+                    if (!isCurrentlyPlaying) {
+                        try { mp.pause() } catch (e: Exception) {}
+                        try { mp.setVolume(1f, 1f) } catch (e: Exception) {}
+                    }
+                }
             }
             
             val hasCustomReverb = activeCustomEffectName != null && appContext != null && LocalMetadataManager.getCustomEffectReverb(appContext!!, activeCustomEffectName) != null
             if (activeEffects.contains(AudioEffectType.REVERB) || hasCustomReverb) {
-                syncReverb()
+                releaseReverb()
+                applyReverb(mp)
             } else {
-                reverbJob?.cancel()
-                reverbMediaPlayer?.release()
-                reverbMediaPlayer = null
+                releaseReverb()
             }
             
             if (activeEffects.contains(AudioEffectType.BASSBOOST)) {
                 try {
                     bassBoost = BassBoost(1, mp.audioSessionId).apply {
                         enabled = true
-                        setStrength(1000)
+                        setStrength(800)
                     }
                 } catch (e: Exception) {
                     Logger.log("BassBoost не поддерживается")
@@ -1320,21 +1358,23 @@ object AudioPlayer {
 
             try {
                 val customEffects = appContext?.let { LocalMetadataManager.getCustomEffects(it) } ?: emptyMap()
-                val activeCustomEffectName = activeCustomEffects.firstOrNull()
                 val customLevels = if (activeCustomEffectName != null) customEffects[activeCustomEffectName] else null
 
                 equalizer = android.media.audiofx.Equalizer(1, mp.audioSessionId).apply {
                     enabled = activeEffects.contains(AudioEffectType.BASSBOOST) || activeCustomEffectName != null
                     val numBands = numberOfBands
+                    val maxRange = bandLevelRange[1]
+                    val bassShelf = (maxRange / 3).toShort().coerceIn(200.toShort(), 500.toShort())
+                    val midShelf = (bassShelf / 2).toShort()
                     for (i in 0 until numBands) {
                         if (customLevels != null && i < customLevels.size) {
                             setBandLevel(i.toShort(), customLevels[i])
                         } else if (activeEffects.contains(AudioEffectType.BASSBOOST)) {
                             val freq = getCenterFreq(i.toShort())
                             if (freq < 150000) {
-                                setBandLevel(i.toShort(), bandLevelRange[1])
+                                setBandLevel(i.toShort(), bassShelf)
                             } else if (freq < 300000) {
-                                setBandLevel(i.toShort(), (bandLevelRange[1] / 2).toShort())
+                                setBandLevel(i.toShort(), midShelf)
                             } else {
                                 setBandLevel(i.toShort(), 0)
                             }
@@ -1358,19 +1398,16 @@ object AudioPlayer {
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
-        reverbJob?.cancel()
-        reverbMediaPlayer?.stop()
-        reverbMediaPlayer?.release()
-        reverbMediaPlayer = null
         try { currentFis?.close() } catch (e: Exception) {}
         currentFis = null
-        reverbMediaPlayer?.pause()
-        reverbJob?.cancel()
         isPlayingState.value = false
         progressJob?.cancel()
         currentTrackName.value = null
+        releaseReverb()
         bassBoost?.release()
         bassBoost = null
+        equalizer?.release()
+        equalizer = null
         context?.let {
             val intent = android.content.Intent(it, PlaybackService::class.java).apply {
                 action = PlaybackService.ACTION_STOP
@@ -1389,63 +1426,13 @@ object AudioPlayer {
     }
 
     fun syncReverb() {
-        reverbJob?.cancel()
-        reverbMediaPlayer?.release()
-        reverbMediaPlayer = null
-        
-        val hasCustomReverb = activeCustomEffects.firstOrNull()?.let { appContext?.let { ctx -> LocalMetadataManager.getCustomEffectReverb(ctx, it) } } != null
-        if (!activeEffects.contains(AudioEffectType.REVERB) && !hasCustomReverb) return
-
-        val activeCustomEffectName = activeCustomEffects.firstOrNull()
-        val customReverb = if (activeCustomEffectName != null && appContext != null) LocalMetadataManager.getCustomEffectReverb(appContext!!, activeCustomEffectName) else null
-        
-        val delayMsBase = customReverb ?: (customReverbDelay.value ?: 150)
-        val effectiveDelay = (delayMsBase / currentSpeed).toInt()
-        val url = lastUrl
-        if (effectiveDelay > 0 && url != null) {
-            reverbMediaPlayer = android.media.MediaPlayer().apply {
-                setAudioAttributes(
-                    android.media.AudioAttributes.Builder()
-                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                        .build()
-                )
-                try {
-                    if (url.startsWith("/")) {
-                        val fis = java.io.FileInputStream(url)
-                        setDataSource(fis.fd)
-                    } else {
-                        setDataSource(url)
-                    }
-                    setVolume(0.3f, 0.3f)
-                    prepareAsync()
-                    setOnPreparedListener { rmp ->
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
-                            var pitch = 1.0f
-                            if (activeEffects.contains(AudioEffectType.PITCH_UP)) pitch *= 1.25f
-                            if (activeEffects.contains(AudioEffectType.PITCH_DOWN)) pitch *= 0.8f
-                            rmp.playbackParams = rmp.playbackParams.apply {
-                                this.speed = currentSpeed
-                                this.pitch = pitch
-                            }
-                            if (!isPlayingState.value) rmp.pause()
-                        }
-                        
-                        val targetPos = (mediaPlayer?.currentPosition ?: 0) - effectiveDelay
-                        if (targetPos > 0) {
-                            rmp.seekTo(targetPos)
-                            if (isPlayingState.value) rmp.start()
-                        } else {
-                            if (isPlayingState.value) {
-                                reverbJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
-                                    kotlinx.coroutines.delay(-targetPos.toLong())
-                                    rmp.start()
-                                }
-                            }
-                        }
-                    }
-                } catch(e:Exception) {}
-            }
+        releaseReverb()
+        val mp = mediaPlayer ?: return
+        val hasCustomReverb = activeCustomEffects.firstOrNull()?.let { 
+            appContext?.let { ctx -> LocalMetadataManager.getCustomEffectReverb(ctx, it) } 
+        } != null
+        if (activeEffects.contains(AudioEffectType.REVERB) || hasCustomReverb) {
+            applyReverb(mp)
         }
     }
 }

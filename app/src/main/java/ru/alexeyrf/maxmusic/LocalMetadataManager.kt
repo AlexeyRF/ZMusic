@@ -10,30 +10,87 @@ import java.io.FileOutputStream
 object LocalMetadataManager {
     private const val PREF_NAME = "local_metadata_prefs"
 
-    fun saveTitle(context: Context, fileId: Long, title: String) {
-        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString("title_$fileId", title).apply()
+    fun normalizeFileName(filename: String): String {
+        return filename
+            .replace('+', ' ')
+            .replace("%20", " ")
+            .replace(Regex("\\s+"), " ")
+            .removePrefix("encrypted_")
+            .removeSuffix(".zmusic")
+            .removeSuffix(".z2")
+            .removeSuffix(".m4a")
+            .removeSuffix(".mp3")
+            .removeSuffix(".ts")
+            .removeSuffix(".rutube.zconfig")
+            .removeSuffix(".youtube.zconfig")
+            .trim()
     }
 
-    fun getTitle(context: Context, fileId: Long): String? {
+    fun saveTitle(context: Context, fileId: Long, title: String, filename: String? = null) {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        return prefs.getString("title_$fileId", null)
+        val editor = prefs.edit().putString("title_$fileId", title)
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            editor.putString("title_$fnKey", title)
+            editor.putString("title_$normKey", title)
+        }
+        editor.apply()
     }
 
-    fun saveArtist(context: Context, fileId: Long, artist: String) {
+    fun getTitle(context: Context, fileId: Long, filename: String? = null): String? {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString("artist_$fileId", artist).apply()
+        val byId = prefs.getString("title_$fileId", null)
+        if (!byId.isNullOrBlank()) return byId
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val byFn = prefs.getString("title_$fnKey", null)
+            if (!byFn.isNullOrBlank()) return byFn
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            val byNorm = prefs.getString("title_$normKey", null)
+            if (!byNorm.isNullOrBlank()) return byNorm
+        }
+        return null
     }
 
-    fun getArtist(context: Context, fileId: Long): String? {
+    fun saveArtist(context: Context, fileId: Long, artist: String, filename: String? = null) {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        return prefs.getString("artist_$fileId", null)
+        val editor = prefs.edit().putString("artist_$fileId", artist)
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            editor.putString("artist_$fnKey", artist)
+            editor.putString("artist_$normKey", artist)
+        }
+        editor.apply()
     }
 
-    fun saveCover(context: Context, fileId: Long, bitmap: Bitmap?) {
+    fun getArtist(context: Context, fileId: Long, filename: String? = null): String? {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val byId = prefs.getString("artist_$fileId", null)
+        if (!byId.isNullOrBlank()) return byId
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val byFn = prefs.getString("artist_$fnKey", null)
+            if (!byFn.isNullOrBlank()) return byFn
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            val byNorm = prefs.getString("artist_$normKey", null)
+            if (!byNorm.isNullOrBlank()) return byNorm
+        }
+        return null
+    }
+
+    fun saveCover(context: Context, fileId: Long, bitmap: Bitmap?, filename: String? = null) {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+        val fnKey = if (!filename.isNullOrBlank()) filename.lowercase().hashCode().toLong() else null
+        val normKey = if (!filename.isNullOrBlank()) normalizeFileName(filename).lowercase().hashCode().toLong() else null
+
         if (bitmap == null) {
-            prefs.edit().remove("cover_$fileId").apply()
+            editor.remove("cover_$fileId")
+            if (fnKey != null) editor.remove("cover_$fnKey")
+            if (normKey != null) editor.remove("cover_$normKey")
+            editor.apply()
             return
         }
         
@@ -44,15 +101,35 @@ object LocalMetadataManager {
         FileOutputStream(coverFile).use { out ->
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
         }
-        prefs.edit().putString("cover_$fileId", coverFile.absolutePath).apply()
+        editor.putString("cover_$fileId", coverFile.absolutePath)
+        if (fnKey != null) {
+            editor.putString("cover_$fnKey", coverFile.absolutePath)
+        }
+        if (normKey != null) {
+            editor.putString("cover_$normKey", coverFile.absolutePath)
+        }
+        editor.apply()
     }
 
-    fun getCover(context: Context, fileId: Long): Bitmap? {
+    fun getCover(context: Context, fileId: Long, filename: String? = null): Bitmap? {
         val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-        val path = prefs.getString("cover_$fileId", null) ?: return null
+        var path = prefs.getString("cover_$fileId", null)
+        if (path == null && !filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            path = prefs.getString("cover_$fnKey", null)
+            if (path == null) {
+                val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+                path = prefs.getString("cover_$normKey", null)
+            }
+        }
+        if (path == null) return null
         val file = File(path)
         if (!file.exists()) return null
-        return BitmapFactory.decodeFile(file.absolutePath)
+        return try {
+            BitmapFactory.decodeFile(file.absolutePath)
+        } catch (e: Exception) {
+            null
+        }
     }
     
     fun savePlaylists(context: Context, fileId: Long, playlists: Set<String>) {

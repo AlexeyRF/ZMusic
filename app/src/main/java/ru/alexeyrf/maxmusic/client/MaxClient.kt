@@ -589,14 +589,16 @@ class MaxClient(
             val list = mutableListOf<MusicMessage>()
             val ctx = context
             for (file in files) {
-                val fileId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                val knownTrack = (cachedMusicList ?: emptyList()).find { it.filename.equals(file.name, ignoreCase = true) }
+                    ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks(ctx).find { it.filename.equals(file.name, ignoreCase = true) }
+                val fileId = knownTrack?.fileId ?: file.name.hashCode().toLong().let { if (it == 0L) 1L else kotlin.math.abs(it) }
                 val rawMod = file.lastModified()
-                val messageId = if (rawMod > 0L) rawMod else fileId
-                val localTitle = if (ctx != null) LocalMetadataManager.getTitle(ctx, fileId) else null
-                val localArtist = if (ctx != null) LocalMetadataManager.getArtist(ctx, fileId) else null
+                val messageId = knownTrack?.messageId?.takeIf { it > 0L } ?: if (rawMod > 0L) rawMod else fileId
+                val localTitle = if (ctx != null) LocalMetadataManager.getTitle(ctx, fileId, file.name) ?: knownTrack?.serverTitle else knownTrack?.serverTitle
+                val localArtist = if (ctx != null) LocalMetadataManager.getArtist(ctx, fileId, file.name) ?: knownTrack?.serverArtist else knownTrack?.serverArtist
                 list.add(MusicMessage(messageId, fileId, file.name, "file://" + file.absolutePath, 0, localTitle, localArtist))
             }
-            return list.distinctBy { it.fileId }.sortedByDescending { it.messageId }
+            return list.distinctBy { it.filename.lowercase() }.sortedByDescending { it.messageId }
         }
         try {
             if (!isConnected()) {
@@ -680,6 +682,10 @@ class MaxClient(
                             ?: ""
                             
                         filename = fixEncoding(filename) ?: ""
+                        try {
+                            filename = java.net.URLDecoder.decode(filename, "UTF-8")
+                        } catch (e: Exception) {}
+                        filename = filename.replace('+', ' ').trim()
 
                         val serverTitle = fixEncoding(
                             preview?.get("title") as? String 
@@ -736,18 +742,36 @@ class MaxClient(
                 val localDir = java.io.File(ctx.filesDir, "local_tracks")
                 val files = if (localDir.exists()) localDir.listFiles() ?: emptyArray() else emptyArray()
                 files.map { file ->
-                    val fileId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                    val knownTrack = (cachedMusicList ?: emptyList()).find { it.filename.equals(file.name, ignoreCase = true) }
+                        ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks(ctx).find { it.filename.equals(file.name, ignoreCase = true) }
+                    val fileId = knownTrack?.fileId ?: file.name.hashCode().toLong().let { if (it == 0L) 1L else kotlin.math.abs(it) }
                     val rawMod = file.lastModified()
-                    val messageId = if (rawMod > 0L) rawMod else fileId
-                    val localTitle = LocalMetadataManager.getTitle(ctx, fileId)
-                    val localArtist = LocalMetadataManager.getArtist(ctx, fileId)
+                    val messageId = knownTrack?.messageId?.takeIf { it > 0L } ?: if (rawMod > 0L) rawMod else fileId
+                    val localTitle = LocalMetadataManager.getTitle(ctx, fileId, file.name) ?: knownTrack?.serverTitle
+                    val localArtist = LocalMetadataManager.getArtist(ctx, fileId, file.name) ?: knownTrack?.serverArtist
                     MusicMessage(messageId, fileId, file.name, "file://" + file.absolutePath, 0, localTitle, localArtist)
                 }
             } else emptyList()
 
-            val combined = (allMessages + updatedCached + localTracks)
-                .distinctBy { it.fileId }
-                .sortedByDescending { it.messageId }
+            val allCandidates = (allMessages + updatedCached + localTracks)
+            val trackMap = mutableMapOf<String, MusicMessage>()
+            for (track in allCandidates) {
+                val norm = LocalMetadataManager.normalizeFileName(track.filename).lowercase()
+                val key = norm.ifBlank { "id_${track.fileId}" }
+                val existing = trackMap[key]
+                if (existing == null) {
+                    trackMap[key] = track
+                } else {
+                    val existingTitle = if (ctx != null) LocalMetadataManager.getTitle(ctx, existing.fileId, existing.filename) ?: existing.serverTitle else existing.serverTitle
+                    val newTitle = if (ctx != null) LocalMetadataManager.getTitle(ctx, track.fileId, track.filename) ?: track.serverTitle else track.serverTitle
+                    val existingHasMeta = !existingTitle.isNullOrBlank()
+                    val newHasMeta = !newTitle.isNullOrBlank()
+                    if (!existingHasMeta && newHasMeta) {
+                        trackMap[key] = track
+                    }
+                }
+            }
+            val combined = trackMap.values.toList().distinctBy { it.fileId }.sortedByDescending { it.messageId }
             
             cachedMusicList = combined.toMutableList()
             saveMusicListCache(combined)
@@ -887,8 +911,9 @@ class MaxClient(
             conn.connectTimeout = 30000
             conn.readTimeout = 90000
             conn.setFixedLengthStreamingMode(fileBytes.size)
-            val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8")
-            conn.setRequestProperty("Content-Disposition", "attachment; filename=$encodedName")
+            val safeHeaderName = fileName.replace("\"", "\\\"")
+            val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
+            conn.setRequestProperty("Content-Disposition", "attachment; filename=\"$safeHeaderName\"; filename*=UTF-8''$encodedName")
             conn.setRequestProperty("Content-Type", "application/octet-stream")
             conn.setRequestProperty("Content-Length", fileBytes.size.toString())
             conn.setRequestProperty("Content-Range", "0-${fileBytes.size - 1}/${fileBytes.size}")
