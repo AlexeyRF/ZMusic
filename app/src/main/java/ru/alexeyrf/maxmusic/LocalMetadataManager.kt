@@ -123,13 +123,62 @@ object LocalMetadataManager {
             }
         }
         if (path == null) return null
-        val file = File(path)
-        if (!file.exists()) return null
+        var file = File(path)
+        if (!file.exists()) {
+            val fallback = File(File(context.filesDir, "custom_covers"), file.name)
+            if (fallback.exists()) file = fallback else return null
+        }
         return try {
             BitmapFactory.decodeFile(file.absolutePath)
         } catch (e: Exception) {
             null
         }
+    }
+
+    fun saveTrim(context: Context, fileId: Long, startSec: Int, endSec: Int, filename: String? = null) {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+            .putInt("trim_start_$fileId", startSec.coerceAtLeast(0))
+            .putInt("trim_end_$fileId", endSec.coerceAtLeast(0))
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            editor.putInt("trim_start_$fnKey", startSec.coerceAtLeast(0))
+            editor.putInt("trim_end_$fnKey", endSec.coerceAtLeast(0))
+            editor.putInt("trim_start_$normKey", startSec.coerceAtLeast(0))
+            editor.putInt("trim_end_$normKey", endSec.coerceAtLeast(0))
+        }
+        editor.apply()
+    }
+
+    fun getStartTrim(context: Context, fileId: Long, filename: String? = null): Int {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val byId = prefs.getInt("trim_start_$fileId", -1)
+        if (byId >= 0) return byId
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val byFn = prefs.getInt("trim_start_$fnKey", -1)
+            if (byFn >= 0) return byFn
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            val byNorm = prefs.getInt("trim_start_$normKey", -1)
+            if (byNorm >= 0) return byNorm
+        }
+        return 0
+    }
+
+    fun getEndTrim(context: Context, fileId: Long, filename: String? = null): Int {
+        val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val byId = prefs.getInt("trim_end_$fileId", -1)
+        if (byId >= 0) return byId
+        if (!filename.isNullOrBlank()) {
+            val fnKey = filename.lowercase().hashCode().toLong()
+            val byFn = prefs.getInt("trim_end_$fnKey", -1)
+            if (byFn >= 0) return byFn
+            val normKey = normalizeFileName(filename).lowercase().hashCode().toLong()
+            val byNorm = prefs.getInt("trim_end_$normKey", -1)
+            if (byNorm >= 0) return byNorm
+        }
+        return 0
     }
     
     fun savePlaylists(context: Context, fileId: Long, playlists: Set<String>) {

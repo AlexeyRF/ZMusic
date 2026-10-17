@@ -152,6 +152,16 @@ class MainActivity : ComponentActivity() {
                 var currentScreen by remember { mutableStateOf(Screen.Auth) }
                 var isStartupAuth by remember { mutableStateOf(true) }
 
+                androidx.activity.compose.BackHandler(enabled = currentScreen != Screen.MusicList) {
+                    when (currentScreen) {
+                        Screen.Settings -> currentScreen = Screen.MusicList
+                        Screen.Auth -> {
+                            if (!isStartupAuth) currentScreen = Screen.MusicList
+                        }
+                        Screen.MusicList -> {}
+                    }
+                }
+
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     when (currentScreen) {
                         Screen.Auth -> {

@@ -133,18 +133,43 @@ fun MusicListScreen(
 
     if (showRutubeOptionsDialog && selectedRutubeVideo != null) {
         val video = selectedRutubeVideo!!
+        var startTrimText by remember(video.id) { mutableStateOf("") }
+        var endTrimText by remember(video.id) { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { showRutubeOptionsDialog = false },
             title = { Text(video.title) },
             text = {
                 Column {
                     Text("Выберите действие:")
+                    Spacer(Modifier.height(12.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = startTrimText,
+                            onValueChange = { if (it.all { c -> c.isDigit() }) startTrimText = it },
+                            label = { Text("Интро (сек)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                        )
+                        OutlinedTextField(
+                            value = endTrimText,
+                            onValueChange = { if (it.all { c -> c.isDigit() }) endTrimText = it },
+                            label = { Text("Аутро (сек)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                        )
+                    }
                     Spacer(Modifier.height(16.dp))
                     Button(onClick = {
+                        val sSec = startTrimText.toIntOrNull() ?: 0
+                        val eSec = endTrimText.toIntOrNull() ?: 0
                         showRutubeOptionsDialog = false
                         coroutineScope.launch {
                             val streamUrl = RutubeExtractor.getPlayUrl(video.id)
                             if (streamUrl != null) {
+                                AudioPlayer.trackStartTrimMs.value = sSec * 1000
+                                AudioPlayer.trackEndTrimMs.value = eSec * 1000
                                 AudioPlayer.playUrl(context, streamUrl, video.title, -1L, "m3u8")
                                 if (video.thumbnailUrl.isNotEmpty()) {
                                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -162,6 +187,8 @@ fun MusicListScreen(
                     }, modifier = Modifier.fillMaxWidth()) { Text("Слушать без сохранения") }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
+                        val sSec = startTrimText.toIntOrNull() ?: 0
+                        val eSec = endTrimText.toIntOrNull() ?: 0
                         showRutubeOptionsDialog = false
                         coroutineScope.launch {
                             isLoading = true
@@ -183,33 +210,73 @@ fun MusicListScreen(
                                     jsonBytes
                                 }
                                 val filename = "${video.title.replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "_")}.rutube.zconfig"
-                                val success = maxClient.sendMusic(filename, processedBytes)
-                                if (success) {
-                                    kotlinx.coroutines.delay(1000)
-                                    val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
-                                    val newTrack = newList.find { it.filename == filename }
-                                    if (newTrack != null) {
-                                        LocalMetadataManager.saveTitle(context, newTrack.fileId, video.title)
-                                        LocalMetadataManager.saveArtist(context, newTrack.fileId, video.author)
-                                        if (video.thumbnailUrl.isNotEmpty()) {
-                                            try {
-                                                val thumbBytes = withContext(Dispatchers.IO) { java.net.URL(video.thumbnailUrl).readBytes() }
-                                                val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
-                                                if (bmp != null) {
-                                                    LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
-                                                }
-                                            } catch (e: Exception) {}
+                                val streamLinksDir = java.io.File(context.filesDir, "stream_links")
+                                if (!streamLinksDir.exists()) streamLinksDir.mkdirs()
+                                val linkFile = java.io.File(streamLinksDir, filename)
+                                linkFile.writeBytes(processedBytes)
+                                
+                                val fileId = filename.hashCode().toLong().let { if (it == 0L) 1L else kotlin.math.abs(it) }
+                                val messageId = System.currentTimeMillis()
+                                
+                                val cacheFile = java.io.File(context.cacheDir, "track_${fileId}.audio")
+                                cacheFile.writeBytes(processedBytes)
+                                
+                                AudioCacheManager.registerTrack(fileId, messageId, filename, video.title, video.author)
+                                LocalMetadataManager.saveTitle(context, fileId, video.title, filename)
+                                LocalMetadataManager.saveArtist(context, fileId, video.author, filename)
+                                if (sSec > 0 || eSec > 0) {
+                                    LocalMetadataManager.saveTrim(context, fileId, sSec, eSec, filename)
+                                }
+                                if (video.thumbnailUrl.isNotEmpty()) {
+                                    try {
+                                        val thumbBytes = withContext(Dispatchers.IO) { java.net.URL(video.thumbnailUrl).readBytes() }
+                                        val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                        if (bmp != null) {
+                                            LocalMetadataManager.saveCover(context, fileId, bmp, filename)
+                                        }
+                                    } catch (e: Exception) {}
+                                }
+                                
+                                val localMsg = MusicMessage(
+                                    messageId = messageId,
+                                    fileId = fileId,
+                                    filename = filename,
+                                    fileUrl = "file://" + linkFile.absolutePath,
+                                    chatId = 0,
+                                    serverTitle = video.title,
+                                    serverArtist = video.author
+                                )
+                                maxClient.addLocalTrack(localMsg)
+                                ConfigManager.saveLocalConfig(context)
+                                
+                                if (maxClient.authToken != null) {
+                                    val parts = ConfigManager.exportConfig(context)
+                                    var allOk = true
+                                    parts.forEach { part ->
+                                        val res = ConfigManager.uploadConfig(context, maxClient, part)
+                                        if (!res) allOk = false
+                                    }
+                                    withContext(Dispatchers.Main) {
+                                        if (allOk) {
+                                            android.widget.Toast.makeText(context, "Ссылка сохранена и конфиг выгружен на сервер", android.widget.Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            android.widget.Toast.makeText(context, "Ссылка сохранена (сбой отправки конфига на сервер)", android.widget.Toast.LENGTH_SHORT).show()
                                         }
                                     }
-                                    musicList = newList
-                                    ConfigManager.saveLocalConfig(context)
+                                } else {
+                                    withContext(Dispatchers.Main) {
+                                        android.widget.Toast.makeText(context, "Ссылка сохранена в локальный конфиг", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
                                 }
+                                musicList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
                             } catch (e: Exception) {}
                             isLoading = false
                         }
                     }, modifier = Modifier.fillMaxWidth()) { Text("Добавить как ссылку") }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
+                        val sSec = startTrimText.toIntOrNull() ?: 0
+                        val eSec = endTrimText.toIntOrNull() ?: 0
                         showRutubeOptionsDialog = false
                         coroutineScope.launch {
                             isLoading = true
@@ -223,7 +290,7 @@ fun MusicListScreen(
                                     val finalFileName = if (CryptoManager.isPasswordSet) {
                                         try {
                                             processedBytes = CryptoManager.encryptBytes(context, rawBytes)
-                                            "encrypted_${uuid}.z2"
+                                            "${uuid}.z2"
                                         } catch (e: Exception) {
                                             "${video.author} - ${video.title}.ts".replace(Regex("[\\\\/:*?\"<>|]"), "_")
                                         }
@@ -240,14 +307,17 @@ fun MusicListScreen(
                                             cacheFile.writeBytes(rawBytes) // Cache decrypted audio
                                             AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, video.title, video.author)
                                             
-                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, video.title)
-                                            LocalMetadataManager.saveArtist(context, newTrack.fileId, video.author)
+                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, video.title, newTrack.filename)
+                                            LocalMetadataManager.saveArtist(context, newTrack.fileId, video.author, newTrack.filename)
+                                            if (sSec > 0 || eSec > 0) {
+                                                LocalMetadataManager.saveTrim(context, newTrack.fileId, sSec, eSec, newTrack.filename)
+                                            }
                                             if (video.thumbnailUrl.isNotEmpty()) {
                                                 try {
                                                     val thumbBytes = withContext(Dispatchers.IO) { java.net.URL(video.thumbnailUrl).readBytes() }
                                                     val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
                                                     if (bmp != null) {
-                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
+                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp, newTrack.filename)
                                                     }
                                                 } catch (e: Exception) {}
                                             }
@@ -269,14 +339,37 @@ fun MusicListScreen(
 
     if (showYouTubeOptionsDialog && selectedYouTubeVideo != null) {
         val video = selectedYouTubeVideo!!
+        var startTrimText by remember(video.id) { mutableStateOf("") }
+        var endTrimText by remember(video.id) { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = { showYouTubeOptionsDialog = false },
             title = { Text(video.title) },
             text = {
                 Column {
                     Text("Выберите действие:")
+                    Spacer(Modifier.height(12.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = startTrimText,
+                            onValueChange = { if (it.all { c -> c.isDigit() }) startTrimText = it },
+                            label = { Text("Интро (сек)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                        )
+                        OutlinedTextField(
+                            value = endTrimText,
+                            onValueChange = { if (it.all { c -> c.isDigit() }) endTrimText = it },
+                            label = { Text("Аутро (сек)") },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                        )
+                    }
                     Spacer(Modifier.height(16.dp))
                     Button(onClick = {
+                        val sSec = startTrimText.toIntOrNull() ?: 0
+                        val eSec = endTrimText.toIntOrNull() ?: 0
                         showYouTubeOptionsDialog = false
                         coroutineScope.launch {
                             isLoading = true
@@ -305,6 +398,9 @@ fun MusicListScreen(
                                     LocalMetadataManager.saveTitle(context, fileId, cleanTitle, fileName)
                                     if (cleanAuthor.isNotEmpty()) {
                                         LocalMetadataManager.saveArtist(context, fileId, cleanAuthor, fileName)
+                                    }
+                                    if (sSec > 0 || eSec > 0) {
+                                        LocalMetadataManager.saveTrim(context, fileId, sSec, eSec, fileName)
                                     }
                                     if (video.thumbnailUrl.isNotEmpty()) {
                                         try {
@@ -348,6 +444,8 @@ fun MusicListScreen(
                     }, modifier = Modifier.fillMaxWidth()) { Text("Скачать в кэш") }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
+                        val sSec = startTrimText.toIntOrNull() ?: 0
+                        val eSec = endTrimText.toIntOrNull() ?: 0
                         showYouTubeOptionsDialog = false
                         if (maxClient.authToken == null) {
                             showMaxAuthPrompt = true
@@ -370,7 +468,7 @@ fun MusicListScreen(
                                     val finalFileName = if (CryptoManager.isPasswordSet) {
                                         try {
                                             processedBytes = CryptoManager.encryptBytes(context, rawBytes)
-                                            "encrypted_${uuid}.z2"
+                                            "${uuid}.z2"
                                         } catch (e: Exception) {
                                             "$safeBaseName.m4a"
                                         }
@@ -393,6 +491,9 @@ fun MusicListScreen(
                                             LocalMetadataManager.saveTitle(context, newTrack.fileId, cleanTitle, newTrack.filename)
                                             if (cleanAuthor.isNotEmpty()) {
                                                 LocalMetadataManager.saveArtist(context, newTrack.fileId, cleanAuthor, newTrack.filename)
+                                            }
+                                            if (sSec > 0 || eSec > 0) {
+                                                LocalMetadataManager.saveTrim(context, newTrack.fileId, sSec, eSec, newTrack.filename)
                                             }
                                             if (video.thumbnailUrl.isNotEmpty()) {
                                                 try {
@@ -531,8 +632,11 @@ fun MusicListScreen(
                     
                     var uploadedCount = 0
                     var skippedCount = 0
+                    var zmusicConvertedCount = 0
                     for (file in childFiles) {
                         val fileName = file.name ?: "uploaded_audio.mp3"
+                        val isZmusic = fileName.endsWith(".zmusic", ignoreCase = true)
+                        val isZ2 = fileName.endsWith(".z2", ignoreCase = true)
                         val normalized = fileName.normalizeTrackName()
                         
                         if (existingNames.contains(normalized)) {
@@ -548,12 +652,21 @@ fun MusicListScreen(
                         var processedBytes = bytes
                         var finalFileName = fileName
                         
-                        val isZmusic = fileName.endsWith(".zmusic") || fileName.endsWith(".z2")
                         val extIndex = fileName.lastIndexOf('.')
                         val rawName = if (extIndex != -1) fileName.substring(0, extIndex) else fileName
                         val fileExt = if (extIndex != -1) fileName.substring(extIndex + 1) else ""
                         
-                        if (!isZmusic) {
+                        if (isZmusic) {
+                            zmusicConvertedCount++
+                            val cleanName = fileName.removeSuffix(".zmusic").removePrefix("encrypted_")
+                            val cleanTitle = cleanName.substringBeforeLast('.')
+                            val u = java.util.UUID.randomUUID().toString()
+                            uuidToTitle[u] = cleanTitle
+                            finalFileName = "${u}.z2"
+                            // bytes are already encrypted in .zmusic, send as .z2
+                        } else if (isZ2) {
+                            // already .z2
+                        } else {
                             var extractedTitle: String? = null
                             try {
                                 val ext = if (fileExt.isNotBlank()) ".$fileExt" else ".tmp"
@@ -570,21 +683,16 @@ fun MusicListScreen(
                             if (extractedTitle.isNullOrBlank()) {
                                 processedBytes = ru.alexeyrf.maxmusic.ID3Editor.embedMetadata(context, processedBytes, rawName, "", null, fileExt)
                             }
-                        }
-                        
-                        if (ru.alexeyrf.maxmusic.CryptoManager.isPasswordSet && !isZmusic) {
-                            try {
-                                processedBytes = ru.alexeyrf.maxmusic.CryptoManager.encryptBytes(context, processedBytes)
-                                val name = if (useZ2) {
+                            
+                            if (ru.alexeyrf.maxmusic.CryptoManager.isPasswordSet) {
+                                try {
+                                    processedBytes = ru.alexeyrf.maxmusic.CryptoManager.encryptBytes(context, processedBytes)
                                     val u = java.util.UUID.randomUUID().toString()
                                     uuidToTitle[u] = rawName
-                                    u
-                                } else {
-                                    rawName
+                                    finalFileName = "${u}.z2"
+                                } catch (e: Exception) {
+                                    ru.alexeyrf.maxmusic.Logger.log("Ошибка шифрования: ${e.message}")
                                 }
-                                finalFileName = if (useZ2) "encrypted_${name}.z2" else "encrypted_${name}.${fileExt}.zmusic"
-                            } catch (e: Exception) {
-                                ru.alexeyrf.maxmusic.Logger.log("Ошибка шифрования: ${e.message}")
                             }
                         }
                         
@@ -593,18 +701,24 @@ fun MusicListScreen(
                     }
                     
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        val msg = if (skippedCount > 0) "Загружено: $uploadedCount, пропущено дубликатов: $skippedCount" else "Загружено треков: $uploadedCount"
-                        android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
+                        val msg = buildString {
+                            append("Загружено треков: $uploadedCount")
+                            if (zmusicConvertedCount > 0) {
+                                append(" (сконвертировано из .zmusic: $zmusicConvertedCount)")
+                            }
+                            if (skippedCount > 0) {
+                                append(", пропущено дубликатов: $skippedCount")
+                            }
+                        }
+                        android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                         musicList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
                         
-                        if (useZ2) {
-                            for (track in musicList) {
-                                if (track.filename.endsWith(".z2")) {
-                                    val uuid = track.filename.removePrefix("encrypted_").substringBefore('.')
-                                    val title = uuidToTitle[uuid]
-                                    if (title != null) {
-                                        ru.alexeyrf.maxmusic.LocalMetadataManager.saveTitle(context, track.fileId, title)
-                                    }
+                        for (track in musicList) {
+                            if (track.filename.endsWith(".z2")) {
+                                val uuid = track.filename.removePrefix("encrypted_").substringBefore('.')
+                                val title = uuidToTitle[uuid]
+                                if (title != null) {
+                                    ru.alexeyrf.maxmusic.LocalMetadataManager.saveTitle(context, track.fileId, title, track.filename)
                                 }
                             }
                         }
@@ -622,47 +736,8 @@ fun MusicListScreen(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
         uri?.let { treeUri ->
-            if (ru.alexeyrf.maxmusic.CryptoManager.isPasswordSet) {
-                massUploadTreeUri = treeUri
-            } else {
-                performMassUpload(treeUri, false)
-            }
+            performMassUpload(treeUri, true)
         }
-    }
-
-    if (massUploadTreeUri != null) {
-        AlertDialog(
-            onDismissRequest = { massUploadTreeUri = null },
-            title = { Text("Загрузка папки") },
-            text = {
-                Column {
-                    Text("Использовать формат .z2 для шифрования?")
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = massUploadUseZ2,
-                            onCheckedChange = { massUploadUseZ2 = it }
-                        )
-                        Text("Шифровать как .z2")
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val uri = massUploadTreeUri!!
-                    val useZ2 = massUploadUseZ2
-                    massUploadTreeUri = null
-                    performMassUpload(uri, useZ2)
-                }) {
-                    Text("Загрузить")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { massUploadTreeUri = null }) {
-                    Text("Отмена")
-                }
-            }
-        )
     }
 
     val filePickerLauncher = rememberLauncherForActivityResult(
@@ -693,14 +768,36 @@ fun MusicListScreen(
                         return@launch
                     }
                     
+                    var workingBytes = bytes
+                    var workingFileName = fileName
+                    var effectiveExt = ext
+
+                    if (ext == "zmusic") {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            android.widget.Toast.makeText(context, "Файл .zmusic будет сконвертирован в формат .z2 при отправке", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                        val cleanName = fileName.removeSuffix(".zmusic").removePrefix("encrypted_")
+                        effectiveExt = if (cleanName.contains('.')) cleanName.substringAfterLast('.').lowercase() else "mp3"
+                        
+                        if (CryptoManager.isPasswordSet) {
+                            try {
+                                val decrypted = CryptoManager.decryptBytes(context, bytes)
+                                workingBytes = decrypted
+                                workingFileName = cleanName
+                            } catch (e: Exception) {
+                                Logger.log("Не удалось расшифровать .zmusic для чтения метаданных: ${e.message}")
+                            }
+                        }
+                    }
+                    
                     var extractedTitle: String? = null
                     var extractedArtist: String? = null
                     var extractedArt: Bitmap? = null
                     
                     try {
-                        val extSuffix = if (ext.isNotBlank()) ".$ext" else ".tmp"
+                        val extSuffix = if (effectiveExt.isNotBlank()) ".$effectiveExt" else ".tmp"
                         val tempFile = java.io.File.createTempFile("meta", extSuffix, context.cacheDir)
-                        tempFile.writeBytes(bytes)
+                        tempFile.writeBytes(workingBytes)
                         val audioFile = org.jaudiotagger.audio.AudioFileIO.read(tempFile)
                         val tag = audioFile.tag
                         if (tag != null) {
@@ -720,9 +817,20 @@ fun MusicListScreen(
                     } catch (e: Exception) {
                     }
                     
+                    if (ext == "zmusic" && extractedTitle.isNullOrBlank()) {
+                        val cleanBase = fileName.removeSuffix(".zmusic").removePrefix("encrypted_").substringBeforeLast('.')
+                        if (cleanBase.contains(" - ")) {
+                            val parts = cleanBase.split(" - ", limit = 2)
+                            if (extractedArtist.isNullOrBlank()) extractedArtist = parts[0].trim()
+                            extractedTitle = parts[1].trim()
+                        } else {
+                            extractedTitle = cleanBase
+                        }
+                    }
+                    
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-                        uploadFileBytes = bytes
-                        uploadFileName = fileName
+                        uploadFileBytes = workingBytes
+                        uploadFileName = workingFileName
                         uploadFileUri = uri
                         uploadFileExtractedTitle = extractedTitle
                         uploadFileExtractedArtist = extractedArtist
@@ -754,7 +862,7 @@ fun MusicListScreen(
                 uploadFileExtractedArtist = null
                 uploadFileExtractedArt = null
             },
-            onSave = { newTitle, newArtist, newCover, useZ2, selectedPlaylists ->
+            onSave = { newTitle, newArtist, newCover, useZ2, selectedPlaylists, startSec, endSec ->
                 val bytesToUpload = uploadFileBytes!!
                 val fileNameToUpload = uploadFileName
                 
@@ -768,8 +876,15 @@ fun MusicListScreen(
                         var unencryptedBytes = bytesToUpload
                         var finalFileName = fileNameToUpload
                         
-                        val isZmusic = fileNameToUpload.endsWith(".zmusic") || fileNameToUpload.endsWith(".z2")
-                        if (!isZmusic && (newTitle.isNotBlank() || newArtist.isNotBlank() || newCover != null)) {
+                        val isZmusic = fileNameToUpload.endsWith(".zmusic")
+                        val isZ2 = fileNameToUpload.endsWith(".z2")
+                        if (isZmusic) {
+                            val u = java.util.UUID.randomUUID().toString()
+                            finalFileName = "${u}.z2"
+                            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                android.widget.Toast.makeText(context, "Файл сконвертирован из .zmusic в .z2", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        } else if (!isZ2 && (newTitle.isNotBlank() || newArtist.isNotBlank() || newCover != null)) {
                             processedBytes = ID3Editor.embedMetadata(context, bytesToUpload, newTitle, newArtist, newCover, ext)
                             val artistPrefix = if (newArtist.isNotBlank()) "$newArtist - " else ""
                             val titlePart = if (newTitle.isNotBlank()) newTitle else rawName
@@ -777,14 +892,11 @@ fun MusicListScreen(
                             unencryptedBytes = processedBytes
                         }
                         
-                        if (CryptoManager.isPasswordSet && !isZmusic) {
+                        if (CryptoManager.isPasswordSet && !isZ2 && !isZmusic) {
                             try {
                                 processedBytes = CryptoManager.encryptBytes(context, processedBytes)
-                                val extIndex = finalFileName.lastIndexOf('.')
-                                val rawName = if (extIndex != -1) finalFileName.substring(0, extIndex) else finalFileName
-                                val name = if (useZ2) java.util.UUID.randomUUID().toString() else rawName
-                                val extt = if (extIndex != -1) finalFileName.substring(extIndex + 1) else ""
-                                finalFileName = if (useZ2) "encrypted_${name}.z2" else "encrypted_${name}.${extt}.zmusic"
+                                val name = java.util.UUID.randomUUID().toString()
+                                finalFileName = "${name}.z2"
                             } catch (e: Exception) {
                                 Logger.log("Ошибка шифрования: ${e.message}")
                             }
@@ -801,14 +913,19 @@ fun MusicListScreen(
                                 cacheFile.writeBytes(unencryptedBytes)
                                 AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, newTrack.serverTitle, newTrack.serverArtist)
                                 
-                                if (useZ2) {
+                                if (useZ2 || finalFileName.endsWith(".z2")) {
                                     val titleToSave = if (newTitle.isNotBlank()) newTitle else rawName
-                                    LocalMetadataManager.saveTitle(context, newTrack.fileId, titleToSave)
-                                    if (newArtist.isNotBlank()) LocalMetadataManager.saveArtist(context, newTrack.fileId, newArtist)
+                                    LocalMetadataManager.saveTitle(context, newTrack.fileId, titleToSave, newTrack.filename)
+                                    if (newArtist.isNotBlank()) LocalMetadataManager.saveArtist(context, newTrack.fileId, newArtist, newTrack.filename)
+                                    if (newCover != null) LocalMetadataManager.saveCover(context, newTrack.fileId, newCover, newTrack.filename)
                                 }
                                 
                                 if (selectedPlaylists.isNotEmpty()) {
                                     LocalMetadataManager.savePlaylists(context, newTrack.fileId, selectedPlaylists)
+                                }
+
+                                if (startSec > 0 || endSec > 0) {
+                                    LocalMetadataManager.saveTrim(context, newTrack.fileId, startSec, endSec, newTrack.filename)
                                 }
                             }
                             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -1058,6 +1175,55 @@ fun MusicListScreen(
     }
 
     var showManagePlaylistsDialog by remember { mutableStateOf(false) }
+
+    val hasBackAction = uploadFileUri != null ||
+        showRutubeOptionsDialog ||
+        showYouTubeOptionsDialog ||
+        showCreatePlaylistDialog ||
+        showAddToPlaylistDialog ||
+        showDeletePlaylistConfirm ||
+        showManagePlaylistsDialog ||
+        showMaxAuthPrompt ||
+        isSelectionMode ||
+        isSearchActive ||
+        selectedPlaylistTab != null
+
+    androidx.activity.compose.BackHandler(enabled = hasBackAction) {
+        when {
+            uploadFileUri != null -> {
+                uploadFileUri = null
+                uploadFileBytes = null
+                uploadFileExtractedTitle = null
+                uploadFileExtractedArtist = null
+                uploadFileExtractedArt = null
+            }
+            showRutubeOptionsDialog -> showRutubeOptionsDialog = false
+            showYouTubeOptionsDialog -> showYouTubeOptionsDialog = false
+            showCreatePlaylistDialog -> showCreatePlaylistDialog = false
+            showAddToPlaylistDialog -> showAddToPlaylistDialog = false
+            showDeletePlaylistConfirm -> showDeletePlaylistConfirm = false
+            showManagePlaylistsDialog -> showManagePlaylistsDialog = false
+            showMaxAuthPrompt -> showMaxAuthPrompt = false
+            isSelectionMode -> {
+                isSelectionMode = false
+                selectedTracks = emptySet()
+            }
+            isSearchActive -> {
+                if (searchQuery.isNotEmpty()) {
+                    searchQuery = ""
+                    rutubeResults = emptyList()
+                    youtubeResults = emptyList()
+                } else {
+                    isSearchActive = false
+                    rutubeResults = emptyList()
+                    youtubeResults = emptyList()
+                }
+            }
+            selectedPlaylistTab != null -> {
+                selectedPlaylistTab = null
+            }
+        }
+    }
 
     if (showManagePlaylistsDialog) {
         var currentOrder by remember { mutableStateOf(allPlaylists) }
@@ -1566,19 +1732,39 @@ fun MusicListScreen(
                         val s = totalSeconds % 60
                         return String.format("%02d:%02d", m, s)
                     }
+
+                    val sTrim = AudioPlayer.trackStartTrimMs.value
+                    val eTrim = AudioPlayer.trackEndTrimMs.value
+                    val rawDur = AudioPlayer.duration.value
+                    val rawPos = AudioPlayer.currentPosition.value
+                    val effectiveDur = (rawDur - eTrim - sTrim).coerceAtLeast(1)
+                    val effectivePos = (rawPos - sTrim).coerceIn(0, effectiveDur)
                     
                     Slider(
-                        value = AudioPlayer.currentPosition.value.toFloat(),
-                        onValueChange = { AudioPlayer.seekTo(it.toInt()) },
-                        valueRange = 0f..(AudioPlayer.duration.value.coerceAtLeast(1)).toFloat(),
+                        value = effectivePos.toFloat(),
+                        onValueChange = { AudioPlayer.seekTo(it.toInt() + sTrim) },
+                        valueRange = 0f..effectiveDur.toFloat(),
                         modifier = Modifier.fillMaxWidth().padding(vertical = 0.dp)
                     )
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(text = formatTimeMs(AudioPlayer.currentPosition.value), style = MaterialTheme.typography.bodySmall)
-                        Text(text = formatTimeMs(AudioPlayer.duration.value), style = MaterialTheme.typography.bodySmall)
+                        Text(text = formatTimeMs(effectivePos), style = MaterialTheme.typography.bodySmall)
+                        if (sTrim > 0 || eTrim > 0) {
+                            val trimLabel = buildString {
+                                append("✂ ")
+                                if (sTrim > 0) append("-${sTrim / 1000}с ")
+                                if (eTrim > 0) append("-${eTrim / 1000}с (кон)")
+                            }
+                            Text(
+                                text = trimLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                        Text(text = formatTimeMs(effectiveDur), style = MaterialTheme.typography.bodySmall)
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1942,23 +2128,93 @@ fun MusicItem(
     if (showLocalEditor) {
         val currentPlaylists = remember { LocalMetadataManager.getPlaylists(context, track.fileId) }
         val allPlaylists = remember { LocalMetadataManager.getAllPlaylists(context) }
+        val currentStartTrim = remember { LocalMetadataManager.getStartTrim(context, track.fileId, track.filename) }
+        val currentEndTrim = remember { LocalMetadataManager.getEndTrim(context, track.fileId, track.filename) }
         MetadataEditorDialog(
             initialTitle = title,
             initialArtist = artist ?: "",
             initialCover = albumArt,
             initialPlaylists = currentPlaylists,
             allPlaylists = allPlaylists,
+            initialStartTrim = currentStartTrim,
+            initialEndTrim = currentEndTrim,
             showEncryptionOption = false,
             onDismiss = { showLocalEditor = false },
-            onSave = { newTitle, newArtist, newCover, _, newPlaylists ->
+            onSave = { newTitle, newArtist, newCover, _, newPlaylists, startSec, endSec ->
                 showLocalEditor = false
                 MusicItemCache.cache[track.fileId] = MusicItemCache.ItemMeta(newTitle, newArtist.ifBlank { null }, newCover)
                 
+                if (AudioPlayer.currentTrackFileId == track.fileId) {
+                    AudioPlayer.updateCurrentTrackTrim(startSec, endSec)
+                }
+
                 kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
-                    LocalMetadataManager.saveTitle(context, track.fileId, newTitle)
-                    LocalMetadataManager.saveArtist(context, track.fileId, newArtist)
-                    LocalMetadataManager.saveCover(context, track.fileId, newCover)
+                    LocalMetadataManager.saveTitle(context, track.fileId, newTitle, track.filename)
+                    LocalMetadataManager.saveArtist(context, track.fileId, newArtist, track.filename)
+                    LocalMetadataManager.saveCover(context, track.fileId, newCover, track.filename)
                     LocalMetadataManager.savePlaylists(context, track.fileId, newPlaylists)
+                    LocalMetadataManager.saveTrim(context, track.fileId, startSec, endSec, track.filename)
+                }
+            }
+        )
+    }
+
+    var showTrimDialog by remember { mutableStateOf(false) }
+    if (showTrimDialog) {
+        val currentStart = remember { LocalMetadataManager.getStartTrim(context, track.fileId, track.filename) }
+        val currentEnd = remember { LocalMetadataManager.getEndTrim(context, track.fileId, track.filename) }
+        var startSecText by remember { mutableStateOf(if (currentStart > 0) currentStart.toString() else "") }
+        var endSecText by remember { mutableStateOf(if (currentEnd > 0) currentEnd.toString() else "") }
+
+        AlertDialog(
+            onDismissRequest = { showTrimDialog = false },
+            title = { Text("Обрезать интро / аутро") },
+            text = {
+                Column {
+                    Text(text = title, style = MaterialTheme.typography.bodyMedium, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "Укажите количество секунд для обрезки начала (интро) или конца (аутро):",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = startSecText,
+                        onValueChange = { if (it.all { c -> c.isDigit() }) startSecText = it },
+                        label = { Text("Пропустить в начале (интро), сек") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = endSecText,
+                        onValueChange = { if (it.all { c -> c.isDigit() }) endSecText = it },
+                        label = { Text("Обрезать в конце (аутро), сек") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val sSec = startSecText.toIntOrNull() ?: 0
+                    val eSec = endSecText.toIntOrNull() ?: 0
+                    showTrimDialog = false
+                    LocalMetadataManager.saveTrim(context, track.fileId, sSec, eSec, track.filename)
+                    if (AudioPlayer.currentTrackFileId == track.fileId) {
+                        AudioPlayer.updateCurrentTrackTrim(sSec, eSec)
+                    }
+                    android.widget.Toast.makeText(context, "Настройки обрезки сохранены", android.widget.Toast.LENGTH_SHORT).show()
+                }) {
+                    Text("Сохранить")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTrimDialog = false }) {
+                    Text("Отмена")
                 }
             }
         )
@@ -1997,6 +2253,7 @@ fun MusicItem(
             appendLine("localArtist: ${localArtist ?: "<null>"}")
             appendLine("hasCover: ${LocalMetadataManager.getCover(context, track.fileId) != null}")
             appendLine("playlists: ${if (playlists.isEmpty()) "<нет>" else playlists.joinToString(", ")}")
+            appendLine("startTrim: ${LocalMetadataManager.getStartTrim(context, track.fileId, track.filename)}s, endTrim: ${LocalMetadataManager.getEndTrim(context, track.fileId, track.filename)}s")
             appendLine()
             appendLine("=== AUDIO CACHE MANAGER ===")
             if (cacheEntry != null) {
@@ -2186,6 +2443,14 @@ fun MusicItem(
                             }
                         )
                         DropdownMenuItem(
+                            text = { Text("Обрезать интро / аутро") },
+                            leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
+                            onClick = { 
+                                showMenu = false
+                                showTrimDialog = true 
+                            }
+                        )
+                        DropdownMenuItem(
                             text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
                             leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                             onClick = { 
@@ -2216,6 +2481,14 @@ fun SettingsScreen(
     var showResetConfirm by remember { mutableStateOf(false) }
     var showRestartPrompt by remember { mutableStateOf(false) }
     var showServerAuthPrompt by remember { mutableStateOf(false) }
+
+    androidx.activity.compose.BackHandler(enabled = true) {
+        if (showLogs) {
+            showLogs = false
+        } else {
+            onBack()
+        }
+    }
     
     val localConfigFile = remember { ConfigManager.getLocalConfigFile(context) }
     var localConfigExists by remember { mutableStateOf(localConfigFile.exists()) }

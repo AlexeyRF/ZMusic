@@ -584,8 +584,11 @@ class MaxClient(
         }
         if (authToken == null) {
             val localDir = java.io.File(context?.filesDir, "local_tracks")
+            val streamLinksDir = java.io.File(context?.filesDir, "stream_links")
             if (!localDir.exists()) localDir.mkdirs()
-            val files = localDir.listFiles() ?: emptyArray()
+            val localFiles = if (localDir.exists()) localDir.listFiles() ?: emptyArray() else emptyArray()
+            val streamFiles = if (streamLinksDir.exists()) streamLinksDir.listFiles() ?: emptyArray() else emptyArray()
+            val files = localFiles + streamFiles
             val list = mutableListOf<MusicMessage>()
             val ctx = context
             for (file in files) {
@@ -740,7 +743,10 @@ class MaxClient(
             val ctx = context
             val localTracks = if (ctx != null) {
                 val localDir = java.io.File(ctx.filesDir, "local_tracks")
-                val files = if (localDir.exists()) localDir.listFiles() ?: emptyArray() else emptyArray()
+                val streamLinksDir = java.io.File(ctx.filesDir, "stream_links")
+                val localFiles = if (localDir.exists()) localDir.listFiles() ?: emptyArray() else emptyArray()
+                val streamFiles = if (streamLinksDir.exists()) streamLinksDir.listFiles() ?: emptyArray() else emptyArray()
+                val files = localFiles + streamFiles
                 files.map { file ->
                     val knownTrack = (cachedMusicList ?: emptyList()).find { it.filename.equals(file.name, ignoreCase = true) }
                         ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks(ctx).find { it.filename.equals(file.name, ignoreCase = true) }
@@ -835,15 +841,19 @@ class MaxClient(
     suspend fun deleteTrack(msgId: Long): Boolean = withContext(Dispatchers.IO) {
         ru.alexeyrf.maxmusic.Logger.log("[Network] Deleting track msgId=$msgId...")
         val localDir = java.io.File(context?.filesDir, "local_tracks")
-        if (localDir.exists()) {
-            val files = localDir.listFiles() ?: emptyArray()
-            for (file in files) {
-                val fId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
-                if (fId == msgId || file.name.hashCode().toLong() == msgId || file.lastModified() == msgId) {
-                    file.delete()
-                    cachedMusicList?.removeAll { it.messageId == msgId || it.fileId == msgId || it.fileId == fId }
-                    cachedMusicList?.let { saveMusicListCache(it) }
-                    return@withContext true
+        val streamLinksDir = java.io.File(context?.filesDir, "stream_links")
+        val allLocalDirs = listOfNotNull(localDir, streamLinksDir)
+        for (dir in allLocalDirs) {
+            if (dir.exists()) {
+                val files = dir.listFiles() ?: emptyArray()
+                for (file in files) {
+                    val fId = file.name.hashCode().toLong().let { if (it == 0L) 1L else kotlin.math.abs(it) }
+                    if (fId == msgId || kotlin.math.abs(file.name.hashCode().toLong()) == msgId || file.lastModified() == msgId) {
+                        file.delete()
+                        cachedMusicList?.removeAll { it.messageId == msgId || it.fileId == msgId || it.fileId == fId }
+                        cachedMusicList?.let { saveMusicListCache(it) }
+                        return@withContext true
+                    }
                 }
             }
         }
@@ -872,17 +882,31 @@ class MaxClient(
     }
 
     suspend fun sendMusic(fileName: String, fileBytes: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        var effectiveFileName = fileName
+        if (effectiveFileName.endsWith(".zmusic", ignoreCase = true)) {
+            val u = java.util.UUID.randomUUID().toString()
+            effectiveFileName = "${u}.z2"
+            ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Файл $fileName сконвертирован в формат .z2 ($effectiveFileName)")
+            val ctx = context
+            if (ctx != null) {
+                val cleanTitle = fileName.removeSuffix(".zmusic").removePrefix("encrypted_").substringBeforeLast('.')
+                LocalMetadataManager.saveTitle(ctx, effectiveFileName.hashCode().toLong(), cleanTitle, effectiveFileName)
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(ctx, "Файл $fileName сконвертирован в формат .z2", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
         if (authToken == null) {
             val ctx = context ?: return@withContext false
             val localDir = java.io.File(ctx.filesDir, "local_tracks")
             if (!localDir.exists()) localDir.mkdirs()
-            val localFile = java.io.File(localDir, fileName)
+            val localFile = java.io.File(localDir, effectiveFileName)
             localFile.writeBytes(fileBytes)
             ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Saved local track to ${localFile.absolutePath}")
             return@withContext true
         }
         try {
-            ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Started upload for fileName='$fileName', size=${fileBytes.size} bytes")
+            ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Started upload for fileName='$effectiveFileName', size=${fileBytes.size} bytes")
             // FILE_UPLOAD = 87
             ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Requesting upload URL via FILE_UPLOAD (87)...")
             val uploadRes = sendRequest(0, 87, mapOf("count" to 1, "profile" to false), 90000L)
@@ -911,9 +935,12 @@ class MaxClient(
             conn.connectTimeout = 30000
             conn.readTimeout = 90000
             conn.setFixedLengthStreamingMode(fileBytes.size)
-            val safeHeaderName = fileName.replace("\"", "\\\"")
-            val encodedName = java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
-            conn.setRequestProperty("Content-Disposition", "attachment; filename=\"$safeHeaderName\"; filename*=UTF-8''$encodedName")
+            val headerFilename = if (effectiveFileName.all { it.code in 33..126 && it != ';' && it != '"' }) {
+                effectiveFileName
+            } else {
+                java.net.URLEncoder.encode(effectiveFileName, "UTF-8")
+            }
+            conn.setRequestProperty("Content-Disposition", "attachment; filename=$headerFilename")
             conn.setRequestProperty("Content-Type", "application/octet-stream")
             conn.setRequestProperty("Content-Length", fileBytes.size.toString())
             conn.setRequestProperty("Content-Range", "0-${fileBytes.size - 1}/${fileBytes.size}")

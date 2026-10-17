@@ -98,6 +98,8 @@ object AudioPlayer {
     
     val currentPosition = mutableStateOf(0)
     val duration = mutableStateOf(0)
+    val trackStartTrimMs = mutableStateOf(0)
+    val trackEndTrimMs = mutableStateOf(0)
     private var progressJob: kotlinx.coroutines.Job? = null
     
     enum class TransitionMode(val id: String, val title: String, val description: String) {
@@ -336,6 +338,10 @@ object AudioPlayer {
                     if (candidate.exists()) file = candidate
                 }
                 if (file == null) {
+                    val streamCandidate = java.io.File(java.io.File(context.filesDir, "stream_links"), track.filename)
+                    if (streamCandidate.exists()) file = streamCandidate
+                }
+                if (file == null) {
                     var effectiveMsgId = track.messageId
                     if (effectiveMsgId <= 0L || effectiveMsgId == track.fileId) {
                         val resolved = client.findValidMessageId(track.fileId) ?: 0L
@@ -361,12 +367,17 @@ object AudioPlayer {
                 }
                 
                 if (file != null) {
-                    if (CryptoManager.isPasswordSet && AudioCacheManager.isAudioFileEncrypted(file)) {
+                    if (CryptoManager.isPasswordSet && !track.filename.endsWith(".rutube.zconfig") && !track.filename.endsWith(".youtube.zconfig") && AudioCacheManager.isAudioFileEncrypted(file)) {
                         AudioCacheManager.ensureDecrypted(context, file)
                     }
 
                     currentTrackFileId = track.fileId
                     currentTrackFilePath = file.absolutePath
+                    
+                    val sTrim = LocalMetadataManager.getStartTrim(context, track.fileId, track.filename)
+                    val eTrim = LocalMetadataManager.getEndTrim(context, track.fileId, track.filename)
+                    trackStartTrimMs.value = sTrim * 1000
+                    trackEndTrimMs.value = eTrim * 1000
                     
                     if (VibeManager.isVibeModeEnabled.value) {
                         val predicted = VibeManager.predictedEffects[track.fileId]
@@ -487,10 +498,31 @@ object AudioPlayer {
         }
     }
     
+    fun updateCurrentTrackTrim(startSec: Int, endSec: Int) {
+        val startMs = startSec.coerceAtLeast(0) * 1000
+        val endMs = endSec.coerceAtLeast(0) * 1000
+        trackStartTrimMs.value = startMs
+        trackEndTrimMs.value = endMs
+        val mp = mediaPlayer
+        if (mp != null && isPlayingState.value) {
+            val dur = mp.duration
+            val effectiveEnd = (dur - endMs).coerceAtLeast(startMs + 1000)
+            if (mp.currentPosition < startMs) {
+                mp.seekTo(startMs)
+                currentPosition.value = startMs
+            } else if (mp.currentPosition >= effectiveEnd) {
+                next()
+            }
+        }
+    }
+    
     fun seekTo(positionMs: Int) {
         cleanupTransition()
-        mediaPlayer?.seekTo(positionMs)
-        currentPosition.value = positionMs
+        val start = trackStartTrimMs.value
+        val end = (duration.value - trackEndTrimMs.value).coerceAtLeast(start + 1000)
+        val clamped = positionMs.coerceIn(start, end)
+        mediaPlayer?.seekTo(clamped)
+        currentPosition.value = clamped
         appContext?.let { updateService(it) }
     }
     
@@ -817,7 +849,8 @@ object AudioPlayer {
                         }
                     } catch (e: Exception) {}
                 }
-                val remaining = if (duration.value > 0) duration.value - currentPosition.value else Int.MAX_VALUE
+                val effectiveEnd = if (duration.value > 0) (duration.value - trackEndTrimMs.value).coerceAtLeast(trackStartTrimMs.value + 1000) else Int.MAX_VALUE
+                val remaining = if (duration.value > 0) effectiveEnd - currentPosition.value else Int.MAX_VALUE
                 val delayMs = if (remaining in 0..12000) 200L else 500L
                 kotlinx.coroutines.delay(delayMs)
             }
@@ -826,14 +859,28 @@ object AudioPlayer {
 
     private fun checkTrackTransition(pos: Int, dur: Int) {
         if (isTransitioning) return
-        if (transitionMode.value == TransitionMode.NORMAL) return
         if (dur <= 0) return
         if (!isPlayingState.value) return
         
-        val transitionMs = (transitionDurationSec.value * 1000).coerceIn(1000, 10000)
-        if (dur <= transitionMs * 2) return
+        val effectiveEnd = (dur - trackEndTrimMs.value).coerceAtLeast(trackStartTrimMs.value + 1000)
         
-        val remaining = dur - pos
+        if (pos >= effectiveEnd) {
+            isTransitioning = true
+            cleanupTransition()
+            if (isRepeat.value) {
+                playCurrentTrack()
+            } else {
+                next()
+            }
+            return
+        }
+
+        if (transitionMode.value == TransitionMode.NORMAL) return
+        
+        val transitionMs = (transitionDurationSec.value * 1000).coerceIn(1000, 10000)
+        if (effectiveEnd - trackStartTrimMs.value <= transitionMs * 2) return
+        
+        val remaining = effectiveEnd - pos
         if (remaining <= transitionMs) {
             isTransitioning = true
             when (transitionMode.value) {
@@ -1077,6 +1124,14 @@ object AudioPlayer {
                     artist = overrideArtist ?: currentMetaArtist,
                     albumArt = currentAlbumArt.value
                 )
+                
+                val sTrim = LocalMetadataManager.getStartTrim(context, fileId)
+                val eTrim = LocalMetadataManager.getEndTrim(context, fileId)
+                trackStartTrimMs.value = sTrim * 1000
+                trackEndTrimMs.value = eTrim * 1000
+            } else if (fileId == -1L && currentTrackFileId == -1L) {
+                trackStartTrimMs.value = 0
+                trackEndTrimMs.value = 0
             }
             
             currentTrackName.value = finalTrackName
@@ -1118,6 +1173,13 @@ object AudioPlayer {
                 setOnPreparedListener { mp ->
                     Logger.log("Плеер готов к воспроизведению: $trackName")
                     applyEffects()
+                    
+                    if (trackStartTrimMs.value > 0) {
+                        try {
+                            mp.seekTo(trackStartTrimMs.value)
+                            AudioPlayer.currentPosition.value = trackStartTrimMs.value
+                        } catch (e: Exception) {}
+                    }
                     
                     if (isCrossfade && fadingPlayer != null) {
                         mp.setVolume(0f, 0f)

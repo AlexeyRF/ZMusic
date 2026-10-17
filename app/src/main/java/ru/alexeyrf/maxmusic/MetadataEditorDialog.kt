@@ -10,6 +10,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material3.*
@@ -28,15 +30,19 @@ fun MetadataEditorDialog(
     initialCover: Bitmap?,
     initialPlaylists: Set<String>,
     allPlaylists: List<String>,
+    initialStartTrim: Int = 0,
+    initialEndTrim: Int = 0,
     showEncryptionOption: Boolean = true,
     onDismiss: () -> Unit,
-    onSave: (String, String, Bitmap?, Boolean, Set<String>) -> Unit
+    onSave: (String, String, Bitmap?, Boolean, Set<String>, Int, Int) -> Unit
 ) {
     var title by remember { mutableStateOf(initialTitle) }
     var artist by remember { mutableStateOf(initialArtist) }
     var cover by remember { mutableStateOf(initialCover) }
-    var useZ2 by remember { mutableStateOf(false) }
+    var useZ2 by remember { mutableStateOf(true) }
     var selectedPlaylists by remember { mutableStateOf(initialPlaylists) }
+    var startTrimStr by remember { mutableStateOf(if (initialStartTrim > 0) initialStartTrim.toString() else "") }
+    var endTrimStr by remember { mutableStateOf(if (initialEndTrim > 0) initialEndTrim.toString() else "") }
 
     val context = LocalContext.current
     val imagePicker = rememberLauncherForActivityResult(
@@ -58,7 +64,11 @@ fun MetadataEditorDialog(
         onDismissRequest = onDismiss,
         title = { Text("Редактировать метаданные") },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(androidx.compose.foundation.rememberScrollState())
+            ) {
                 Box(
                     modifier = Modifier
                         .size(120.dp)
@@ -97,6 +107,34 @@ fun MetadataEditorDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Обрезка трека (интро / аутро)", style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = startTrimStr,
+                        onValueChange = { startTrimStr = it.filter { c -> c.isDigit() } },
+                        label = { Text("Интро (сек)") },
+                        placeholder = { Text("0") },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = endTrimStr,
+                        onValueChange = { endTrimStr = it.filter { c -> c.isDigit() } },
+                        label = { Text("Аутро (сек)") },
+                        placeholder = { Text("0") },
+                        modifier = Modifier.weight(1f),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                        singleLine = true
+                    )
+                }
+                Text(
+                    "Пропустить первые и последние секунды трека при воспроизведении",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
                 if (allPlaylists.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text("Плейлисты", style = MaterialTheme.typography.titleSmall)
@@ -117,15 +155,16 @@ fun MetadataEditorDialog(
                 
                 if (showEncryptionOption && CryptoManager.isPasswordSet) {
                     Spacer(modifier = Modifier.height(8.dp))
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(checked = useZ2, onCheckedChange = { useZ2 = it })
-                        Text("Шифровать метаданные (.z2)")
-                    }
+                    Text("Файл будет зашифрован в формате .z2", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                 }
             }
         },
         confirmButton = {
-            Button(onClick = { onSave(title, artist, cover, useZ2, selectedPlaylists) }) {
+            Button(onClick = {
+                val sSec = startTrimStr.toIntOrNull() ?: 0
+                val eSec = endTrimStr.toIntOrNull() ?: 0
+                onSave(title, artist, cover, useZ2, selectedPlaylists, sSec, eSec)
+            }) {
                 Text("Сохранить")
             }
         },

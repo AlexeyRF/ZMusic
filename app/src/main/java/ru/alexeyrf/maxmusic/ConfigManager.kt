@@ -46,6 +46,26 @@ object ConfigManager {
                         }
                     }
                 }
+
+                // Add stream_links
+                val streamLinksDir = File(context.filesDir, "stream_links")
+                if (streamLinksDir.exists()) {
+                    streamLinksDir.listFiles()?.forEach { file ->
+                        if (file.isFile) {
+                            zos.putNextEntry(ZipEntry("stream_links/${file.name}"))
+                            file.inputStream().use { it.copyTo(zos) }
+                            zos.closeEntry()
+                        }
+                    }
+                }
+
+                // Add saved_music_cache.json
+                val savedCache = File(context.filesDir, "saved_music_cache.json")
+                if (savedCache.exists()) {
+                    zos.putNextEntry(ZipEntry("files/saved_music_cache.json"))
+                    savedCache.inputStream().use { it.copyTo(zos) }
+                    zos.closeEntry()
+                }
             }
             
             // 2. Encrypt the ZIP
@@ -164,12 +184,26 @@ object ConfigManager {
             ZipInputStream(decryptedZip.inputStream()).use { zis ->
                 var entry = zis.nextEntry
                 while (entry != null) {
-                    val targetFile = File(context.applicationInfo.dataDir, entry.name)
+                    val targetFile = when {
+                        entry.name.startsWith("custom_covers/") -> File(context.filesDir, entry.name)
+                        entry.name.startsWith("stream_links/") -> File(context.filesDir, entry.name)
+                        entry.name.startsWith("files/") -> File(context.filesDir, entry.name.removePrefix("files/"))
+                        entry.name.startsWith("shared_prefs/") -> File(context.applicationInfo.dataDir, entry.name)
+                        else -> File(context.applicationInfo.dataDir, entry.name)
+                    }
                     // Ensure parent exists
                     targetFile.parentFile?.mkdirs()
                     
                     targetFile.outputStream().use { fos ->
                         zis.copyTo(fos)
+                    }
+                    // Also duplicate custom_covers to dataDir/custom_covers if needed for compatibility
+                    if (entry.name.startsWith("custom_covers/")) {
+                        try {
+                            val compatFile = File(context.applicationInfo.dataDir, entry.name)
+                            compatFile.parentFile?.mkdirs()
+                            targetFile.copyTo(compatFile, overwrite = true)
+                        } catch (e: Exception) {}
                     }
                     zis.closeEntry()
                     entry = zis.nextEntry
