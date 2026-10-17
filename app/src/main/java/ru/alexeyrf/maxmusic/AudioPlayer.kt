@@ -1,4 +1,4 @@
-﻿package ru.alexeyrf.maxmusic
+package ru.alexeyrf.maxmusic
 
 import android.net.Uri
 import android.os.Bundle
@@ -43,7 +43,7 @@ import android.media.audiofx.PresetReverb
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import kotlinx.coroutines.CoroutineScope
-
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import ru.alexeyrf.maxmusic.client.MaxClient
 import ru.alexeyrf.maxmusic.client.MusicMessage
@@ -99,6 +99,71 @@ object AudioPlayer {
     val duration = mutableStateOf(0)
     private var progressJob: kotlinx.coroutines.Job? = null
     
+    enum class TransitionMode(val id: String, val title: String, val description: String) {
+        NORMAL("normal", "Обычный", "Стандартное воспроизведение без переходов"),
+        FADE("fade", "Затухание", "Плавное затихание в конце трека и нарастание громкости следующего"),
+        CRISPY("crispy", "Криспи", "Лаконичное наложение треков: плавный и чистый переход без каши")
+    }
+
+    val transitionMode = mutableStateOf(TransitionMode.NORMAL)
+    val transitionDurationSec = mutableStateOf(4)
+    val manualTransitionEnabled = mutableStateOf(false)
+    
+    var isTransitioning = false
+    private var transitionJob: kotlinx.coroutines.Job? = null
+    private var fadingPlayer: MediaPlayer? = null
+    private var fadingFis: java.io.FileInputStream? = null
+
+    fun initSettings(context: Context) {
+        appContext = context.applicationContext
+        val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        val modeStr = prefs.getString("transition_mode", TransitionMode.NORMAL.id) ?: TransitionMode.NORMAL.id
+        transitionMode.value = TransitionMode.values().find { it.id == modeStr } ?: TransitionMode.NORMAL
+        transitionDurationSec.value = prefs.getInt("transition_duration", 4)
+        manualTransitionEnabled.value = prefs.getBoolean("manual_transition_enabled", false)
+    }
+
+    fun setTransitionMode(context: Context, mode: TransitionMode) {
+        transitionMode.value = mode
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            .edit()
+            .putString("transition_mode", mode.id)
+            .apply()
+    }
+
+    fun setTransitionDuration(context: Context, seconds: Int) {
+        val clamped = seconds.coerceIn(1, 10)
+        transitionDurationSec.value = clamped
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            .edit()
+            .putInt("transition_duration", clamped)
+            .apply()
+    }
+
+    fun setManualTransitionEnabled(context: Context, enabled: Boolean) {
+        manualTransitionEnabled.value = enabled
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("manual_transition_enabled", enabled)
+            .apply()
+    }
+
+    fun cleanupTransition() {
+        transitionJob?.cancel()
+        transitionJob = null
+        isTransitioning = false
+        fadingPlayer?.let { fp ->
+            try {
+                fp.stop()
+                fp.release()
+            } catch (e: Exception) {}
+        }
+        fadingPlayer = null
+        try { fadingFis?.close() } catch (e: Exception) {}
+        fadingFis = null
+        try { mediaPlayer?.setVolume(1.0f, 1.0f) } catch (e: Exception) {}
+    }
+
     val isRepeat = mutableStateOf(false)
     enum class PlayMode { SEQUENTIAL, SHUFFLE, SIMILAR }
     val playMode = mutableStateOf(PlayMode.SEQUENTIAL)
@@ -144,6 +209,96 @@ object AudioPlayer {
         trackHistory.add(startIndex)
         historyIndex = 0
     }
+
+    fun selectTrack(context: Context, client: ru.alexeyrf.maxmusic.client.MaxClient, list: List<ru.alexeyrf.maxmusic.client.MusicMessage>, index: Int) {
+        appContext = context.applicationContext
+        maxClient = client
+        if (index !in list.indices) return
+
+        val isSameList = (playlist == list)
+        val isPlaying = isPlayingState.value && mediaPlayer?.isPlaying == true
+        val canTransition = manualTransitionEnabled.value && isPlaying && (transitionMode.value != TransitionMode.NORMAL)
+
+        if (canTransition) {
+            if (isSameList && currentTrackIndex == index) {
+                return
+            }
+            playlist = list
+            when (transitionMode.value) {
+                TransitionMode.CRISPY -> {
+                    if (isTransitioning) cleanupTransition()
+                    fadingPlayer = mediaPlayer
+                    fadingFis = currentFis
+                    mediaPlayer = null
+                    currentFis = null
+                    isTransitioning = true
+                    fadingPlayer?.setOnCompletionListener {
+                        try { fadingPlayer?.release() } catch (e: Exception) {}
+                        fadingPlayer = null
+                        try { fadingFis?.close() } catch (e: Exception) {}
+                        fadingFis = null
+                    }
+                    currentTrackIndex = index
+                    if (!isSameList) {
+                        trackHistory.clear()
+                        trackHistory.add(index)
+                        historyIndex = 0
+                    } else {
+                        if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
+                            trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                        }
+                        trackHistory.add(index)
+                        if (trackHistory.size > 500) trackHistory.removeAt(0)
+                        historyIndex = trackHistory.size - 1
+                    }
+                    playCurrentTrack(isCrossfade = true)
+                }
+                TransitionMode.FADE -> {
+                    if (isTransitioning) cleanupTransition()
+                    isTransitioning = true
+                    val outgoing = mediaPlayer
+                    transitionJob?.cancel()
+                    transitionJob = CoroutineScope(Dispatchers.Main).launch {
+                        val fadeOutMs = (transitionDurationSec.value * 250L).coerceIn(400L, 1500L)
+                        val interval = 30L
+                        val steps = (fadeOutMs / interval).toInt().coerceAtLeast(10)
+                        for (step in 1..steps) {
+                            kotlinx.coroutines.delay(interval)
+                            if (!isTransitioning) break
+                            val fraction = 1.0f - (step.toFloat() / steps)
+                            val vol = (fraction * fraction).coerceIn(0f, 1f)
+                            try { outgoing?.setVolume(vol, vol) } catch (e: Exception) {}
+                        }
+                        isTransitioning = false
+                        cleanupTransition()
+                        currentTrackIndex = index
+                        if (!isSameList) {
+                            trackHistory.clear()
+                            trackHistory.add(index)
+                            historyIndex = 0
+                        } else {
+                            if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
+                                trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                            }
+                            trackHistory.add(index)
+                            if (trackHistory.size > 500) trackHistory.removeAt(0)
+                            historyIndex = trackHistory.size - 1
+                        }
+                        playCurrentTrack(fadeIn = true)
+                    }
+                }
+                TransitionMode.NORMAL -> {
+                    cleanupTransition()
+                    setPlaylist(context, client, list, index)
+                    playCurrentTrack()
+                }
+            }
+        } else {
+            cleanupTransition()
+            setPlaylist(context, client, list, index)
+            playCurrentTrack()
+        }
+    }
     
     fun rebuildVibePlaylist(context: Context, fullList: List<ru.alexeyrf.maxmusic.client.MusicMessage>? = null, activePlaylist: String? = null) {
         if (VibeManager.isVibeModeEnabled.value) {
@@ -163,22 +318,52 @@ object AudioPlayer {
         }
     }
 
-    fun playCurrentTrack() {
+    fun playCurrentTrack(fadeIn: Boolean = false, isCrossfade: Boolean = false) {
         val track = playlist.getOrNull(currentTrackIndex) ?: return
         val context = appContext ?: return
         val client = maxClient ?: return
         
+        if (!isCrossfade) {
+            cleanupTransition()
+        }
+        
         CoroutineScope(Dispatchers.Main).launch {
             try {
                 var file = AudioCacheManager.getTrackFile(context, track.fileId)
+                if (file == null && track.fileUrl.isNotBlank()) {
+                    val candidate = java.io.File(track.fileUrl.removePrefix("file://"))
+                    if (candidate.exists()) file = candidate
+                }
                 if (file == null) {
-                    val url = client.getFileDownloadUrl(track.messageId, track.fileId)
+                    var effectiveMsgId = track.messageId
+                    if (effectiveMsgId <= 0L || effectiveMsgId == track.fileId) {
+                        val resolved = client.findValidMessageId(track.fileId) ?: 0L
+                        if (resolved > 0L) effectiveMsgId = resolved
+                    }
+                    val url = client.getFileDownloadUrl(effectiveMsgId, track.fileId)
                     if (url != null) {
-                        file = AudioCacheManager.downloadTrack(context, track.fileId, url, track.filename)
+                        if (url.startsWith("file://") || java.io.File(url).exists()) {
+                            val candidate = java.io.File(url.removePrefix("file://"))
+                            if (candidate.exists()) file = candidate
+                        } else {
+                            file = AudioCacheManager.downloadTrack(
+                                context, 
+                                track.fileId, 
+                                url, 
+                                track.filename,
+                                effectiveMsgId,
+                                track.serverTitle,
+                                track.serverArtist
+                            )
+                        }
                     }
                 }
                 
                 if (file != null) {
+                    if (CryptoManager.isPasswordSet && AudioCacheManager.isAudioFileEncrypted(file)) {
+                        AudioCacheManager.ensureDecrypted(context, file)
+                    }
+
                     currentTrackFileId = track.fileId
                     currentTrackFilePath = file.absolutePath
                     
@@ -194,63 +379,115 @@ object AudioPlayer {
                     
                     val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId)
                     val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId)
+                    val rawClean = when {
+                        track.filename.endsWith(".rutube.zconfig") -> track.filename.removeSuffix(".rutube.zconfig").replace('_', ' ')
+                        track.filename.endsWith(".youtube.zconfig") -> track.filename.removeSuffix(".youtube.zconfig").replace('_', ' ')
+                        else -> track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
+                    }
                     val fallbackName = if (!overrideTitle.isNullOrBlank()) {
                         if (!overrideArtist.isNullOrBlank()) "$overrideArtist - $overrideTitle" else overrideTitle
                     } else if (!track.serverTitle.isNullOrBlank()) {
                         if (!track.serverArtist.isNullOrBlank()) "${track.serverArtist} - ${track.serverTitle}" else track.serverTitle
-                    } else track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
+                    } else rawClean
                     val ext = track.filename.substringAfterLast('.', "mp3").lowercase()
-                    if (track.filename.endsWith(".rutube.zconfig")) {
+                    if (track.filename.endsWith(".rutube.zconfig") || track.filename.endsWith(".youtube.zconfig")) {
+                        val isYouTube = track.filename.endsWith(".youtube.zconfig")
                         try {
-                            val json = org.json.JSONObject(file.readText())
+                            val raw = file.readBytes()
+                            val text = if (CryptoManager.isPasswordSet) {
+                                try {
+                                    val dec = CryptoManager.decryptBytes(context, raw)
+                                    String(dec, Charsets.UTF_8)
+                                } catch (e: Exception) {
+                                    String(raw, Charsets.UTF_8)
+                                }
+                            } else {
+                                String(raw, Charsets.UTF_8)
+                            }
+                            val json = org.json.JSONObject(text)
                             val videoId = json.optString("id")
-                            val streamUrl = RutubeExtractor.getPlayUrl(videoId)
-                            if (streamUrl != null) {
-                                playUrl(context, streamUrl, fallbackName, track.fileId, "m3u8")
+                            val rawStreamUrl = if (isYouTube) {
+                                YouTubeExtractor.getPlayUrl(context, videoId)
+                            } else {
+                                RutubeExtractor.getPlayUrl(videoId)
+                            }
+                            if (rawStreamUrl != null) {
+                                val streamUrl = if (isYouTube) {
+                                    LocalProxyServer.getStreamUrl(context, rawStreamUrl)
+                                } else {
+                                    rawStreamUrl
+                                }
+                                val format = if (isYouTube) "m4a" else "m3u8"
+                                playUrl(context, streamUrl, fallbackName, track.fileId, format, fadeIn = fadeIn, isCrossfade = isCrossfade)
                                 val thumbUrl = json.optString("thumbnail")
                                 if (thumbUrl.isNotEmpty()) {
                                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
                                         try {
-                                            val thumbBytes = java.net.URL(thumbUrl).readBytes()
+                                            val proxy = if (isYouTube) ProxyManager.getProxy(context) else java.net.Proxy.NO_PROXY
+                                            val thumbBytes = java.net.URL(thumbUrl).openConnection(proxy).getInputStream().readBytes()
                                             val bmp = android.graphics.BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
                                             currentAlbumArt.value = bmp
                                         } catch(e: Exception) {}
                                     }
                                 }
                             } else {
-                                Logger.log("Не удалось получить поток Rutube")
+                                Logger.log("Не удалось получить поток ${if (isYouTube) "YouTube" else "Rutube"}")
                                 next()
                             }
                         } catch (e: Exception) {
-                            Logger.log("Ошибка чтения Rutube ссылки")
+                            Logger.log("Ошибка чтения ${if (isYouTube) "YouTube" else "Rutube"} ссылки")
                             next()
                         }
                     } else {
-                        playUrl(context, file.absolutePath, fallbackName, track.fileId, ext)
+                        playUrl(context, file.absolutePath, fallbackName, track.fileId, ext, fadeIn = fadeIn, isCrossfade = isCrossfade)
                     }
                 }
                 
-                // Prefetch next track if sequential
-                if (playMode.value == PlayMode.SEQUENTIAL && !isCachedOnly.value && playlist.size > 1) {
-                    val nextIdx = (currentTrackIndex + 1) % playlist.size
-                    val nextTrack = playlist[nextIdx]
-                    CoroutineScope(Dispatchers.IO).launch {
-                        val nextFile = java.io.File(context.cacheDir, "track_${nextTrack.fileId}.audio")
-                        if (!nextFile.exists()) {
-                            val nextUrl = client.getFileDownloadUrl(nextTrack.messageId, nextTrack.fileId)
-                            if (nextUrl != null) {
-                                AudioCacheManager.downloadTrack(context, nextTrack.fileId, nextUrl, nextTrack.filename)
+                // Prefetch next track if applicable
+                if (!isCachedOnly.value && playlist.size > 1) {
+                    val nextIdx = calculateNextTrackIndex()
+                    if (nextIdx in playlist.indices && nextIdx != currentTrackIndex) {
+                        val nextTrack = playlist[nextIdx]
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val nextFile = java.io.File(context.cacheDir, "track_${nextTrack.fileId}.audio")
+                            if (!nextFile.exists()) {
+                                var nextMsgId = nextTrack.messageId
+                                if (nextMsgId <= 0L || nextMsgId == nextTrack.fileId) {
+                                    val resolved = client.findValidMessageId(nextTrack.fileId) ?: 0L
+                                    if (resolved > 0L) nextMsgId = resolved
+                                }
+                                val nextUrl = client.getFileDownloadUrl(nextMsgId, nextTrack.fileId)
+                                if (nextUrl != null) {
+                                    AudioCacheManager.downloadTrack(
+                                        context, 
+                                        nextTrack.fileId, 
+                                        nextUrl, 
+                                        nextTrack.filename,
+                                        nextMsgId,
+                                        nextTrack.serverTitle,
+                                        nextTrack.serverArtist
+                                    )
+                                }
                             }
                         }
                     }
                 }
             } catch (e: Exception) {
                 Logger.log("Ошибка загрузки трека: ${e.localizedMessage}")
+                if (isCrossfade && fadingPlayer != null) {
+                    mediaPlayer = fadingPlayer
+                    currentFis = fadingFis
+                    fadingPlayer = null
+                    fadingFis = null
+                    try { mediaPlayer?.setVolume(1f, 1f) } catch (err: Exception) {}
+                    isTransitioning = false
+                }
             }
         }
     }
     
     fun seekTo(positionMs: Int) {
+        cleanupTransition()
         mediaPlayer?.seekTo(positionMs)
         currentPosition.value = positionMs
         val delay = customReverbDelay.value
@@ -275,18 +512,16 @@ object AudioPlayer {
         appContext?.let { updateService(it) }
     }
     
-    fun next() {
-        if (playlist.isEmpty()) return
-        if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
-        val context = appContext ?: return
+    fun calculateNextTrackIndex(): Int {
+        if (playlist.isEmpty()) return -1
+        if (isRepeat.value) return currentTrackIndex
+        if (currentTrackIndex !in playlist.indices) return 0
         
         if ((playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
-            historyIndex++
-            currentTrackIndex = trackHistory[historyIndex]
-            playCurrentTrack()
-            return
+            return trackHistory[historyIndex + 1]
         }
 
+        val context = appContext
         var nextIndex = currentTrackIndex
         var attempts = 0
         
@@ -294,13 +529,7 @@ object AudioPlayer {
             if (playMode.value == PlayMode.SHUFFLE) {
                 nextIndex = playlist.indices.random()
             } else if (playMode.value == PlayMode.SIMILAR) {
-                // Find track with closest BPM
                 val currentFileId = playlist[currentTrackIndex].fileId
-                val currentEffectStr = if (activeEffects.isEmpty()) "NORMAL" else activeEffects.map { it.name }.sorted().joinToString("+")
-                val currentKey = "${currentFileId}_$currentEffectStr"
-                
-                // Read TrackStats directly via reflection or SharedPreferences if needed.
-                val context = appContext
                 if (context != null) {
                     val currentFile = AudioCacheManager.getTrackFile(context, currentFileId)
                     val targetBpm = if (currentFile != null) VibeManager.analyzeTrackBpm(currentFile, activeEffects.toSet()) else 120f
@@ -328,27 +557,228 @@ object AudioPlayer {
             } else {
                 nextIndex = (nextIndex + 1) % playlist.size
             }
-            if (!isCachedOnly.value) break
+            if (!isCachedOnly.value || context == null) break
             
-            val track = playlist[nextIndex]
+            val track = playlist.getOrNull(nextIndex) ?: break
             if (java.io.File(context.cacheDir, "track_${track.fileId}.audio").exists()) break
             
             attempts++
             if (attempts >= playlist.size) break
         } while (true)
         
+        return nextIndex
+    }
+
+    fun next(fadeIn: Boolean = false) {
+        if (playlist.isEmpty()) return
+        
+        val isPlaying = isPlayingState.value && mediaPlayer?.isPlaying == true
+        val canTransition = !fadeIn && manualTransitionEnabled.value && isPlaying && (transitionMode.value != TransitionMode.NORMAL)
+        
+        if (canTransition) {
+            if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
+            
+            val isHistory = (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex >= 0 && historyIndex < trackHistory.size - 1
+            val targetIndex = if (isHistory) {
+                trackHistory[historyIndex + 1]
+            } else {
+                calculateNextTrackIndex()
+            }
+            if (targetIndex != -1) {
+                when (transitionMode.value) {
+                    TransitionMode.CRISPY -> {
+                        if (isTransitioning) cleanupTransition()
+                        fadingPlayer = mediaPlayer
+                        fadingFis = currentFis
+                        mediaPlayer = null
+                        currentFis = null
+                        isTransitioning = true
+                        fadingPlayer?.setOnCompletionListener {
+                            try { fadingPlayer?.release() } catch (e: Exception) {}
+                            fadingPlayer = null
+                            try { fadingFis?.close() } catch (e: Exception) {}
+                            fadingFis = null
+                        }
+                        if (isHistory) {
+                            historyIndex++
+                            currentTrackIndex = trackHistory[historyIndex]
+                        } else {
+                            currentTrackIndex = targetIndex
+                            if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                            trackHistory.add(targetIndex)
+                            if (trackHistory.size > 500) trackHistory.removeAt(0)
+                            historyIndex = trackHistory.size - 1
+                        }
+                        playCurrentTrack(isCrossfade = true)
+                        return
+                    }
+                    TransitionMode.FADE -> {
+                        if (isTransitioning) cleanupTransition()
+                        isTransitioning = true
+                        val outgoing = mediaPlayer
+                        transitionJob?.cancel()
+                        transitionJob = CoroutineScope(Dispatchers.Main).launch {
+                            val fadeOutMs = (transitionDurationSec.value * 250L).coerceIn(400L, 1500L)
+                            val interval = 30L
+                            val steps = (fadeOutMs / interval).toInt().coerceAtLeast(10)
+                            for (step in 1..steps) {
+                                kotlinx.coroutines.delay(interval)
+                                if (!isTransitioning) break
+                                val fraction = 1.0f - (step.toFloat() / steps)
+                                val vol = (fraction * fraction).coerceIn(0f, 1f)
+                                try { outgoing?.setVolume(vol, vol) } catch (e: Exception) {}
+                            }
+                            isTransitioning = false
+                            cleanupTransition()
+                            if (isHistory) {
+                                historyIndex++
+                                currentTrackIndex = trackHistory[historyIndex]
+                            } else {
+                                currentTrackIndex = targetIndex
+                                if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                                trackHistory.add(targetIndex)
+                                if (trackHistory.size > 500) trackHistory.removeAt(0)
+                                historyIndex = trackHistory.size - 1
+                            }
+                            playCurrentTrack(fadeIn = true)
+                        }
+                        return
+                    }
+                    TransitionMode.NORMAL -> {}
+                }
+            }
+        }
+
+        cleanupTransition()
+        if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
+        
+        if ((playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
+            historyIndex++
+            currentTrackIndex = trackHistory[historyIndex]
+            playCurrentTrack(fadeIn = fadeIn)
+            return
+        }
+
+        val nextIndex = calculateNextTrackIndex()
+        if (nextIndex == -1) return
+        
         currentTrackIndex = nextIndex
         if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
         trackHistory.add(nextIndex)
         if (trackHistory.size > 500) trackHistory.removeAt(0)
         historyIndex = trackHistory.size - 1
-        playCurrentTrack()
+        playCurrentTrack(fadeIn = fadeIn)
     }
     
     fun prev() {
         if (playlist.isEmpty()) return
-        if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
         val context = appContext ?: return
+        
+        val isPlaying = isPlayingState.value && mediaPlayer?.isPlaying == true
+        val canTransition = manualTransitionEnabled.value && isPlaying && (transitionMode.value != TransitionMode.NORMAL)
+        
+        if (canTransition) {
+            if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
+            val isHistory = (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex > 0
+            val targetIndex = if (isHistory) {
+                trackHistory[historyIndex - 1]
+            } else {
+                var nextIndex = currentTrackIndex
+                var attempts = 0
+                do {
+                    if (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) {
+                        nextIndex = playlist.indices.random()
+                    } else {
+                        nextIndex = if (nextIndex - 1 < 0) playlist.size - 1 else nextIndex - 1
+                    }
+                    if (!isCachedOnly.value) break
+                    val track = playlist[nextIndex]
+                    if (java.io.File(context.cacheDir, "track_${track.fileId}.audio").exists()) break
+                    attempts++
+                    if (attempts >= playlist.size) break
+                } while (true)
+                nextIndex
+            }
+            
+            if (targetIndex != -1) {
+                when (transitionMode.value) {
+                    TransitionMode.CRISPY -> {
+                        if (isTransitioning) cleanupTransition()
+                        fadingPlayer = mediaPlayer
+                        fadingFis = currentFis
+                        mediaPlayer = null
+                        currentFis = null
+                        isTransitioning = true
+                        fadingPlayer?.setOnCompletionListener {
+                            try { fadingPlayer?.release() } catch (e: Exception) {}
+                            fadingPlayer = null
+                            try { fadingFis?.close() } catch (e: Exception) {}
+                            fadingFis = null
+                        }
+                        if (isHistory) {
+                            historyIndex--
+                            currentTrackIndex = trackHistory[historyIndex]
+                        } else {
+                            currentTrackIndex = targetIndex
+                            if (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) {
+                                trackHistory.add(0, targetIndex)
+                                if (trackHistory.size > 500) trackHistory.removeAt(trackHistory.size - 1)
+                                historyIndex = 0
+                            } else {
+                                if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                                trackHistory.add(targetIndex)
+                                if (trackHistory.size > 500) trackHistory.removeAt(0)
+                                historyIndex = trackHistory.size - 1
+                            }
+                        }
+                        playCurrentTrack(isCrossfade = true)
+                        return
+                    }
+                    TransitionMode.FADE -> {
+                        if (isTransitioning) cleanupTransition()
+                        isTransitioning = true
+                        val outgoing = mediaPlayer
+                        transitionJob?.cancel()
+                        transitionJob = CoroutineScope(Dispatchers.Main).launch {
+                            val fadeOutMs = (transitionDurationSec.value * 250L).coerceIn(400L, 1500L)
+                            val interval = 30L
+                            val steps = (fadeOutMs / interval).toInt().coerceAtLeast(10)
+                            for (step in 1..steps) {
+                                kotlinx.coroutines.delay(interval)
+                                if (!isTransitioning) break
+                                val fraction = 1.0f - (step.toFloat() / steps)
+                                val vol = (fraction * fraction).coerceIn(0f, 1f)
+                                try { outgoing?.setVolume(vol, vol) } catch (e: Exception) {}
+                            }
+                            isTransitioning = false
+                            cleanupTransition()
+                            if (isHistory) {
+                                historyIndex--
+                                currentTrackIndex = trackHistory[historyIndex]
+                            } else {
+                                currentTrackIndex = targetIndex
+                                if (playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) {
+                                    trackHistory.add(0, targetIndex)
+                                    if (trackHistory.size > 500) trackHistory.removeAt(trackHistory.size - 1)
+                                    historyIndex = 0
+                                } else {
+                                    if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                                    trackHistory.add(targetIndex)
+                                    if (trackHistory.size > 500) trackHistory.removeAt(0)
+                                    historyIndex = trackHistory.size - 1
+                                }
+                            }
+                            playCurrentTrack(fadeIn = true)
+                        }
+                        return
+                    }
+                    TransitionMode.NORMAL -> {}
+                }
+            }
+        }
+
+        cleanupTransition()
+        if (currentTrackIndex !in playlist.indices) currentTrackIndex = 0
         
         if ((playMode.value == PlayMode.SHUFFLE || playMode.value == PlayMode.SIMILAR) && historyIndex > 0) {
             historyIndex--
@@ -388,6 +818,163 @@ object AudioPlayer {
         }
         playCurrentTrack()
     }
+
+    fun startProgressTracker() {
+        progressJob?.cancel()
+        progressJob = CoroutineScope(Dispatchers.Main).launch {
+            while (isActive) {
+                val mp = mediaPlayer
+                if (mp != null) {
+                    try {
+                        if (isPlayingState.value && mp.isPlaying) {
+                            val pos = mp.currentPosition
+                            val dur = mp.duration
+                            AudioPlayer.currentPosition.value = pos
+                            if (dur > 0) AudioPlayer.duration.value = dur
+                            checkTrackTransition(pos, dur)
+                        }
+                    } catch (e: Exception) {}
+                }
+                val remaining = if (duration.value > 0) duration.value - currentPosition.value else Int.MAX_VALUE
+                val delayMs = if (remaining in 0..12000) 200L else 500L
+                kotlinx.coroutines.delay(delayMs)
+            }
+        }
+    }
+
+    private fun checkTrackTransition(pos: Int, dur: Int) {
+        if (isTransitioning) return
+        if (transitionMode.value == TransitionMode.NORMAL) return
+        if (dur <= 0) return
+        if (!isPlayingState.value) return
+        
+        val transitionMs = (transitionDurationSec.value * 1000).coerceIn(1000, 10000)
+        if (dur <= transitionMs * 2) return
+        
+        val remaining = dur - pos
+        if (remaining <= transitionMs) {
+            isTransitioning = true
+            when (transitionMode.value) {
+                TransitionMode.FADE -> {
+                    transitionJob?.cancel()
+                    transitionJob = CoroutineScope(Dispatchers.Main).launch {
+                        val fadeOutDuration = remaining.toLong().coerceAtLeast(800L)
+                        val interval = 40L
+                        val steps = (fadeOutDuration / interval).toInt().coerceAtLeast(15)
+                        for (step in 1..steps) {
+                            kotlinx.coroutines.delay(interval)
+                            if (!isTransitioning) break
+                            val fraction = 1.0f - (step.toFloat() / steps)
+                            val vol = (fraction * fraction).coerceIn(0f, 1f)
+                            try {
+                                mediaPlayer?.setVolume(vol, vol)
+                            } catch (e: Exception) {}
+                        }
+                        isTransitioning = false
+                        if (isRepeat.value) {
+                            playCurrentTrack(fadeIn = true)
+                        } else {
+                            next(fadeIn = true)
+                        }
+                    }
+                }
+                TransitionMode.CRISPY -> {
+                    val nextIdx = calculateNextTrackIndex()
+                    if (nextIdx != -1 && playlist.isNotEmpty()) {
+                        fadingPlayer = mediaPlayer
+                        fadingFis = currentFis
+                        mediaPlayer = null
+                        currentFis = null
+                        
+                        fadingPlayer?.setOnCompletionListener {
+                            try { fadingPlayer?.release() } catch (e: Exception) {}
+                            fadingPlayer = null
+                            try { fadingFis?.close() } catch (e: Exception) {}
+                            fadingFis = null
+                        }
+                        
+                        currentTrackIndex = nextIdx
+                        if (historyIndex >= 0 && historyIndex < trackHistory.size - 1) {
+                            trackHistory.subList(historyIndex + 1, trackHistory.size).clear()
+                        }
+                        trackHistory.add(nextIdx)
+                        if (trackHistory.size > 500) trackHistory.removeAt(0)
+                        historyIndex = trackHistory.size - 1
+                        
+                        playCurrentTrack(isCrossfade = true)
+                    } else {
+                        isTransitioning = false
+                    }
+                }
+                TransitionMode.NORMAL -> {
+                    isTransitioning = false
+                }
+            }
+        }
+    }
+
+    private fun startCrossfadeAnimation(incoming: MediaPlayer, outgoing: MediaPlayer?) {
+        transitionJob?.cancel()
+        transitionJob = CoroutineScope(Dispatchers.Main).launch {
+            val durationMs = (transitionDurationSec.value * 1000L).coerceIn(1500L, 8000L)
+            val interval = 40L
+            val steps = (durationMs / interval).toInt().coerceAtLeast(20)
+            
+            for (step in 1..steps) {
+                kotlinx.coroutines.delay(interval)
+                if (!isTransitioning) break
+                
+                val p = (step.toFloat() / steps).coerceIn(0f, 1f)
+                val angle = p * (Math.PI / 2.0)
+                
+                // Outgoing: equal power with crisp ducking to avoid bass clash
+                val volOut = (kotlin.math.cos(angle).toFloat() * (1.0f - p * 0.35f)).coerceIn(0f, 1f)
+                // Incoming: equal power fade in
+                val volIn = kotlin.math.sin(angle).toFloat().coerceIn(0f, 1f)
+                
+                try {
+                    outgoing?.setVolume(volOut, volOut)
+                } catch (e: Exception) {}
+                try {
+                    incoming.setVolume(volIn, volIn)
+                } catch (e: Exception) {}
+            }
+            
+            try {
+                incoming.setVolume(1f, 1f)
+            } catch (e: Exception) {}
+            
+            try {
+                outgoing?.stop()
+                outgoing?.release()
+            } catch (e: Exception) {}
+            if (fadingPlayer == outgoing) fadingPlayer = null
+            try { fadingFis?.close() } catch (e: Exception) {}
+            fadingFis = null
+            isTransitioning = false
+        }
+    }
+
+    private fun startFadeInAnimation(incoming: MediaPlayer) {
+        transitionJob?.cancel()
+        transitionJob = CoroutineScope(Dispatchers.Main).launch {
+            val durationMs = (transitionDurationSec.value * 500L).coerceIn(800L, 3000L)
+            val interval = 40L
+            val steps = (durationMs / interval).toInt().coerceAtLeast(15)
+            
+            for (step in 1..steps) {
+                kotlinx.coroutines.delay(interval)
+                val p = (step.toFloat() / steps).coerceIn(0f, 1f)
+                val vol = (p * p).coerceIn(0f, 1f)
+                try {
+                    incoming.setVolume(vol, vol)
+                } catch (e: Exception) {}
+            }
+            try {
+                incoming.setVolume(1f, 1f)
+            } catch (e: Exception) {}
+        }
+    }
     
     data class TrackMetadata(val title: String?, val artist: String?, val albumArt: Bitmap?)
 
@@ -396,6 +983,11 @@ object AudioPlayer {
         try {
             val file = java.io.File(filePath)
             if (!file.exists()) return TrackMetadata(null, null, null)
+            
+            val ctx = appContext ?: AudioCacheManager.appContext
+            if (ctx != null && CryptoManager.isPasswordSet && AudioCacheManager.isAudioFileEncrypted(file)) {
+                AudioCacheManager.ensureDecrypted(ctx, file)
+            }
             
             var targetFile = file
             if (filePath.endsWith(".audio")) {
@@ -429,8 +1021,26 @@ object AudioPlayer {
                         }
                     }
                 }
-                return TrackMetadata(title, artist, art)
+                if (title != null || artist != null || art != null) {
+                    return TrackMetadata(title, artist, art)
+                }
             }
+            
+            // Fallback: MediaMetadataRetriever (e.g. for .ts or AAC or container streams)
+            try {
+                val retriever = android.media.MediaMetadataRetriever()
+                retriever.setDataSource(filePath)
+                val rTitle = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_TITLE)?.takeIf { it.isNotBlank() }
+                val rArtist = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST)?.takeIf { it.isNotBlank() }
+                val rArtBytes = retriever.embeddedPicture
+                val rArt = if (rArtBytes != null) {
+                    try { BitmapFactory.decodeByteArray(rArtBytes, 0, rArtBytes.size) } catch (t: Throwable) { null }
+                } else null
+                retriever.release()
+                if (rTitle != null || rArtist != null || rArt != null) {
+                    return TrackMetadata(rTitle, rArtist, rArt)
+                }
+            } catch (e: Exception) {}
         } catch (t: Throwable) {
             Logger.log("Ошибка извлечения метаданных (Jaudiotagger): ${t.message}")
         } finally {
@@ -439,12 +1049,22 @@ object AudioPlayer {
         return TrackMetadata(null, null, null)
     }
     
-    fun playUrl(context: Context? = null, url: String, trackName: String, fileId: Long = -1L, originalExt: String = "mp3") {
+    fun playUrl(
+        context: Context? = null, 
+        url: String, 
+        trackName: String, 
+        fileId: Long = -1L, 
+        originalExt: String = "mp3",
+        fadeIn: Boolean = false,
+        isCrossfade: Boolean = false
+    ) {
         try {
             recordVibeEvent()
-            mediaPlayer?.release()
-            try { currentFis?.close() } catch (e: Exception) {}
-            currentFis = null
+            if (!isCrossfade) {
+                mediaPlayer?.release()
+                try { currentFis?.close() } catch (e: Exception) {}
+                currentFis = null
+            }
             
             lastUrl = url
             var finalTrackName = trackName
@@ -481,7 +1101,9 @@ object AudioPlayer {
             }
             
             currentTrackName.value = finalTrackName
-            isPlayingState.value = false
+            if (!isCrossfade) {
+                isPlayingState.value = false
+            }
             
             mediaPlayer = MediaPlayer().apply {
                 setAudioAttributes(
@@ -499,32 +1121,58 @@ object AudioPlayer {
                 prepareAsync()
                 setOnErrorListener { mp, what, extra ->
                     Logger.log("MediaPlayer error: what=$what extra=$extra")
-                    isPlayingState.value = false
-                    mp.reset()
+                    if (isCrossfade && fadingPlayer != null) {
+                        mediaPlayer = fadingPlayer
+                        currentFis = fadingFis
+                        fadingPlayer = null
+                        fadingFis = null
+                        try { mediaPlayer?.setVolume(1f, 1f) } catch (e: Exception) {}
+                        isTransitioning = false
+                    } else {
+                        isPlayingState.value = false
+                        progressJob?.cancel()
+                        context?.let { updateService(it) }
+                        mp.reset()
+                    }
                     true
                 }
                 setOnPreparedListener { mp ->
                     Logger.log("Плеер готов к воспроизведению: $trackName")
                     applyEffects()
-                    mp.start() 
-                    isPlayingState.value = true
-                    syncReverb()
-                    AudioPlayer.duration.value = mp.duration
-                    currentTrackStartTime = System.currentTimeMillis()
                     
-                    progressJob?.cancel()
-                    progressJob = CoroutineScope(Dispatchers.Main).launch {
-                        while(true) {
-                            if (mediaPlayer?.isPlaying == true) {
-                                AudioPlayer.currentPosition.value = mediaPlayer?.currentPosition ?: 0
-                            }
-                            kotlinx.coroutines.delay(1000)
-                        }
+                    if (isCrossfade && fadingPlayer != null) {
+                        mp.setVolume(0f, 0f)
+                        mp.start()
+                        isPlayingState.value = true
+                        syncReverb()
+                        AudioPlayer.duration.value = mp.duration
+                        currentTrackStartTime = System.currentTimeMillis()
+                        startCrossfadeAnimation(mp, fadingPlayer)
+                    } else if (fadeIn) {
+                        mp.setVolume(0f, 0f)
+                        mp.start()
+                        isPlayingState.value = true
+                        syncReverb()
+                        AudioPlayer.duration.value = mp.duration
+                        currentTrackStartTime = System.currentTimeMillis()
+                        startFadeInAnimation(mp)
+                    } else {
+                        mp.setVolume(1f, 1f)
+                        mp.start()
+                        isPlayingState.value = true
+                        syncReverb()
+                        AudioPlayer.duration.value = mp.duration
+                        currentTrackStartTime = System.currentTimeMillis()
                     }
                     
+                    startProgressTracker()
                     context?.let { updateService(it) }
                 }
                 setOnCompletionListener {
+                    if (isTransitioning && fadingPlayer != null) {
+                        return@setOnCompletionListener
+                    }
+                    cleanupTransition()
                     isPlayingState.value = false
                     progressJob?.cancel()
                     if (isRepeat.value) {
@@ -533,20 +1181,22 @@ object AudioPlayer {
                         next()
                     }
                 }
-                setOnErrorListener { _, what, extra ->
-                    Logger.log("Ошибка MediaPlayer: what=$what extra=$extra")
-                    isPlayingState.value = false
-                    progressJob?.cancel()
-                    context?.let { updateService(it) }
-                    true
-                }
             }
         } catch (t: Throwable) {
             Logger.log("Ошибка инициализации плеера: ${t.message}")
+            if (isCrossfade && fadingPlayer != null) {
+                mediaPlayer = fadingPlayer
+                currentFis = fadingFis
+                fadingPlayer = null
+                fadingFis = null
+                try { mediaPlayer?.setVolume(1f, 1f) } catch (e: Exception) {}
+                isTransitioning = false
+            }
         }
     }
     
     fun pause(context: Context? = null) {
+        cleanupTransition()
         if (mediaPlayer?.isPlaying == true) {
             mediaPlayer?.pause()
         }
@@ -577,15 +1227,7 @@ object AudioPlayer {
                 }
             }
         }
-        progressJob?.cancel()
-        progressJob = CoroutineScope(Dispatchers.Main).launch {
-            while(true) {
-                if (mediaPlayer?.isPlaying == true) {
-                    currentPosition.value = mediaPlayer?.currentPosition ?: 0
-                }
-                kotlinx.coroutines.delay(1000)
-            }
-        }
+        startProgressTracker()
         context?.let { updateService(it) }
     }
     
@@ -712,6 +1354,7 @@ object AudioPlayer {
     }
     
     fun stop(context: Context? = null) {
+        cleanupTransition()
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null

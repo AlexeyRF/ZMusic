@@ -10,12 +10,15 @@ import org.msgpack.value.ValueType
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.Socket
+import java.net.InetSocketAddress
+import javax.net.ssl.SSLSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.net.HttpURLConnection
 import java.net.URL
 import java.io.OutputStream
+import ru.alexeyrf.maxmusic.LocalMetadataManager
 
 data class MusicMessage(
     val messageId: Long,
@@ -88,12 +91,50 @@ class MaxClient(
         return h1 + h2 + h3
     }
 
-    suspend fun connect() = withContext(Dispatchers.IO) {
+    private val connectMutex = kotlinx.coroutines.sync.Mutex()
+
+    private fun getOpcodeName(opcode: Int): String = when (opcode) {
+        1 -> "PING"
+        6 -> "SESSION_INIT"
+        17 -> "AUTH_REQUEST"
+        18 -> "AUTH"
+        19 -> "LOGIN"
+        49 -> "CHAT_HISTORY"
+        64 -> "MSG_SEND"
+        66 -> "MSG_DELETE"
+        87 -> "FILE_UPLOAD"
+        88 -> "FILE_DOWNLOAD"
+        115 -> "AUTH_CHECK_PASSWORD"
+        136 -> "NOTIF_ATTACH"
+        else -> "OP_$opcode"
+    }
+
+    suspend fun connect() = connectMutex.withLock {
+        connectInternal()
+    }
+
+    private suspend fun connectInternal() = withContext(Dispatchers.IO) {
+        if (isConnected()) return@withContext
         try {
-            Log.d(tag, "Connecting to $host:$port via SSL")
-            socket = javax.net.ssl.SSLSocketFactory.getDefault().createSocket(host, port)
-            input = DataInputStream(socket!!.getInputStream())
-            output = DataOutputStream(socket!!.getOutputStream())
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Connecting to $host:$port (SSL, connectTimeout=8s, soTimeout=30s)...")
+            val startTime = System.currentTimeMillis()
+
+            val sslFactory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            val rawSocket = Socket()
+            rawSocket.tcpNoDelay = true
+            rawSocket.keepAlive = true
+            rawSocket.soTimeout = 30000
+            rawSocket.connect(InetSocketAddress(host, port), 8000)
+
+            val sslSocket = sslFactory.createSocket(rawSocket, host, port, true) as SSLSocket
+            sslSocket.startHandshake()
+            
+            socket = sslSocket
+            input = DataInputStream(sslSocket.getInputStream())
+            output = DataOutputStream(sslSocket.getOutputStream())
+
+            val connTime = System.currentTimeMillis() - startTime
+            ru.alexeyrf.maxmusic.Logger.log("[Network] SSL connected in ${connTime}ms (${sslSocket.session.cipherSuite})")
 
             readerScope.launch {
                 readLoop()
@@ -104,9 +145,9 @@ class MaxClient(
                 while(isActive) {
                     delay(25000)
                     try {
-                        sendRequest(0, 1, mapOf("interactive" to true)) // PING = 1
+                        sendRequest(0, 1, mapOf("interactive" to true), timeoutMs = 10000L) // PING = 1
                     } catch (e: Exception) {
-                        Log.e(tag, "Ping error", e)
+                        ru.alexeyrf.maxmusic.Logger.log("[Network] Ping error: ${e.message}")
                     }
                 }
             }
@@ -120,7 +161,7 @@ class MaxClient(
             val screenStr = "${metrics.densityDpi}dpi ${metrics.densityDpi}dpi ${metrics.widthPixels}x${metrics.heightPixels}"
 
             // Отправляем первый пакет SESSION_INIT (opcode: 6)
-            val newDeviceId = java.util.UUID.randomUUID().toString()
+            val newDeviceId = if (deviceId.isNotBlank()) deviceId else java.util.UUID.randomUUID().toString()
             val handshakePayload = mapOf(
                 "mt_instanceid" to java.util.UUID.randomUUID().toString(),
                 "userAgent" to mapOf(
@@ -139,18 +180,20 @@ class MaxClient(
                 "clientSessionId" to 1,
                 "deviceId" to newDeviceId
             )
-            val sessionRes = sendRequest(cmd = 0, opcode = 6, payload = handshakePayload)
+            val sessionRes = sendRequest(cmd = 0, opcode = 6, payload = handshakePayload, timeoutMs = 15000L)
             deviceId = newDeviceId
             callsSeed = (sessionRes["callsSeed"] as? Number)?.toLong() ?: 0L
-            Log.d(tag, "Connected and session initialized, callsSeed=${callsSeed}")
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Session initialized successfully! callsSeed=$callsSeed")
         } catch (e: Exception) {
-            Log.e(tag, "Connection failed", e)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Connection/init failed: ${e.message}")
+            disconnectInternal()
             throw e
         }
     }
 
     private suspend fun readLoop() {
         val stream = input ?: return
+        ru.alexeyrf.maxmusic.Logger.log("[Network] Socket readLoop started")
         try {
             while (currentCoroutineContext().isActive) {
                 val header = ByteArray(10)
@@ -174,43 +217,46 @@ class MaxClient(
                     try {
                         payloadBytes = decompressLz4(payloadBytes)
                     } catch (e: Exception) {
-                        Log.e(tag, "LZ4 decompress error", e)
+                        ru.alexeyrf.maxmusic.Logger.log("[Network] LZ4 decompress error: ${e.message}")
                     }
                 }
 
                 val payload = if (payloadBytes.isNotEmpty()) decodeMsgPack(payloadBytes) else emptyMap<String, Any>()
-
-                Log.d(tag, "Received frame: cmd=$cmd, opcode=$opcode, seq=$seq, payloadLen=$payloadLen")
                 handleIncomingFrame(cmd.toInt(), seq, opcode, payload)
             }
         } catch (e: Exception) {
-            Log.e(tag, "Read loop error, socket closed", e)
-            disconnect()
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Socket readLoop closed: ${e.message}")
+            disconnectInternal()
         }
     }
 
     private val fileUploadWaiters = ConcurrentHashMap<Long, CompletableDeferred<Boolean>>()
 
     private fun handleIncomingFrame(cmd: Int, seq: Int, opcode: Int, payload: Map<String, Any>) {
+        val opName = getOpcodeName(opcode)
         if (cmd == 1 || cmd == 3) { // RESPONSE or ERROR
-            pendingRequests.remove(seq)?.complete(payload)
+            val waiter = pendingRequests.remove(seq)
+            if (waiter != null) {
+                waiter.complete(payload)
+            } else {
+                ru.alexeyrf.maxmusic.Logger.log("[Network] Unmatched frame: cmd=$cmd, seq=$seq, opcode=$opcode ($opName)")
+            }
         } else if (cmd == 2) { // EVENT
-            // Обработка асинхронных событий (NOTIF_*) 
-            Log.d(tag, "Received event: opcode=$opcode payload=$payload")
+            ru.alexeyrf.maxmusic.Logger.log("[Network] <<< Event: opcode=$opcode ($opName)")
             if (opcode == 136) { // NOTIF_ATTACH
                 val fileIdStr = payload["fileId"]?.toString() ?: payload["file_id"]?.toString()
                 val fileId = fileIdStr?.toLongOrNull()
-                ru.alexeyrf.maxmusic.Logger.log("Parsed fileId from NOTIF_ATTACH: $fileId")
+                ru.alexeyrf.maxmusic.Logger.log("[Network] Parsed fileId from NOTIF_ATTACH: $fileId")
                 if (fileId != null) {
                     val waiter = fileUploadWaiters.remove(fileId)
                     if (waiter != null) {
-                        ru.alexeyrf.maxmusic.Logger.log("Completing fileUploadWaiters for fileId=$fileId")
+                        ru.alexeyrf.maxmusic.Logger.log("[Network] Completing fileUploadWaiters for fileId=$fileId")
                         waiter.complete(true)
                     } else {
-                        ru.alexeyrf.maxmusic.Logger.log("No waiter found for fileId=$fileId")
+                        ru.alexeyrf.maxmusic.Logger.log("[Network] No waiter found for fileId=$fileId")
                     }
                 } else {
-                    ru.alexeyrf.maxmusic.Logger.log("NOTIF_ATTACH payload didn't contain valid file_id/fileId: $payload")
+                    ru.alexeyrf.maxmusic.Logger.log("[Network] NOTIF_ATTACH payload didn't contain valid file_id/fileId: $payload")
                 }
             }
         }
@@ -220,22 +266,36 @@ class MaxClient(
         val seq = seqCounter.incrementAndGet() and 0xFFFF
         val deferred = CompletableDeferred<Map<String, Any>>()
         pendingRequests[seq] = deferred
-        sendFrame(cmd, seq, opcode, payload)
+        val opName = getOpcodeName(opcode)
+        val startTime = System.currentTimeMillis()
+        
+        ru.alexeyrf.maxmusic.Logger.log("[Network] >>> Request: seq=$seq, opcode=$opcode ($opName), timeout=${timeoutMs}ms")
+
+        try {
+            sendFrame(cmd, seq, opcode, payload)
+        } catch (e: Exception) {
+            pendingRequests.remove(seq)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] !!! Failed to send frame for seq=$seq, opcode=$opcode ($opName): ${e.message}")
+            throw e
+        }
         
         // Wait for response
         val response = withTimeoutOrNull(timeoutMs) { deferred.await() }
+        val elapsed = System.currentTimeMillis() - startTime
         if (response == null) {
             pendingRequests.remove(seq)
-            throw Exception("Тайм-аут запроса для opcode $opcode")
+            ru.alexeyrf.maxmusic.Logger.log("[Network] !!! Timeout after ${elapsed}ms for seq=$seq, opcode=$opcode ($opName)")
+            throw Exception("Тайм-аут запроса для opcode $opcode ($opName)")
         }
         
         // Проверка на ошибку. Pymax Command.ERROR = 3
         if (response.containsKey("error")) {
             val errMsg = "Ошибка API: ${response["error"]} - ${response["message"]}"
-            Log.e(tag, errMsg)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] !!! API Error (${elapsed}ms) for seq=$seq, opcode=$opcode ($opName): $errMsg")
             throw Exception(errMsg)
         }
         
+        ru.alexeyrf.maxmusic.Logger.log("[Network] <<< Response OK (${elapsed}ms) for seq=$seq, opcode=$opcode ($opName)")
         response
     }
 
@@ -346,22 +406,26 @@ class MaxClient(
             "draftsSync" to -1,
             "presenceSync" to -1,
             "interactive" to true
-        ))
+        ), timeoutMs = 20000L)
         
         if (res["token"] != null) {
             authToken = res["token"] as String
         }
         isAuthenticated = true
+        ru.alexeyrf.maxmusic.Logger.log("[Network] Logged in successfully! (isAuthenticated=true)")
         return true
     }
 
-    suspend fun resumeSession(): Boolean {
-        if (authToken == null) return false
-        return try {
-            connect()
+    suspend fun resumeSession(): Boolean = connectMutex.withLock {
+        if (authToken == null) return@withLock false
+        if (isConnected()) return@withLock true
+        return@withLock try {
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Resuming session with existing token...")
+            disconnectInternal()
+            connectInternal()
             doLogin()
         } catch (e: Exception) {
-            Log.e(tag, "Resume session failed", e)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Resume session failed: ${e.message}")
             false
         }
     }
@@ -408,44 +472,170 @@ class MaxClient(
     private var cachedMusicList: MutableList<MusicMessage>? = null
     private var isHistoryFullyLoaded = false
 
+    private fun saveMusicListCache(list: List<MusicMessage>) {
+        val ctx = context ?: return
+        try {
+            val file = java.io.File(ctx.filesDir, "saved_music_cache.json")
+            val arr = org.json.JSONArray()
+            for (m in list) {
+                val obj = org.json.JSONObject()
+                obj.put("messageId", m.messageId)
+                obj.put("fileId", m.fileId)
+                obj.put("filename", m.filename)
+                obj.put("fileUrl", m.fileUrl)
+                obj.put("chatId", m.chatId)
+                if (m.serverTitle != null) obj.put("serverTitle", m.serverTitle)
+                if (m.serverArtist != null) obj.put("serverArtist", m.serverArtist)
+                arr.put(obj)
+            }
+            file.writeText(arr.toString())
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    fun isCorruptedTrack(track: MusicMessage): Boolean {
+        val name = track.filename.trim()
+        val isPlaceholderName = name.startsWith("Track ") || 
+                                name.startsWith("Cached Track") || 
+                                name.startsWith("track_") || 
+                                name == "Unknown file" || 
+                                name.isBlank()
+        val isBogusMsgId = track.messageId <= 0L || track.messageId == track.fileId
+        return (isPlaceholderName && track.serverTitle.isNullOrBlank()) || isBogusMsgId
+    }
+
+    fun findValidMessageId(fileId: Long): Long? {
+        val fromCache = cachedMusicList?.find { it.fileId == fileId && it.messageId > 0L && it.messageId != fileId }?.messageId
+        if (fromCache != null) return fromCache
+        val entry = ru.alexeyrf.maxmusic.AudioCacheManager.getEntry(fileId)
+        if (entry != null && entry.messageId > 0L && entry.messageId != fileId) {
+            return entry.messageId
+        }
+        return null
+    }
+
+    fun addLocalTrack(track: MusicMessage) {
+        val current = (cachedMusicList ?: loadMusicListCache() ?: emptyList()).toMutableList()
+        current.removeAll { it.fileId == track.fileId || it.filename == track.filename }
+        current.add(0, track)
+        cachedMusicList = current
+        saveMusicListCache(current)
+        ru.alexeyrf.maxmusic.AudioCacheManager.registerTrack(
+            track.fileId,
+            track.messageId,
+            track.filename,
+            track.serverTitle,
+            track.serverArtist
+        )
+    }
+
+    fun loadMusicListCache(): List<MusicMessage>? {
+        val ctx = context ?: return null
+        return try {
+            val file = java.io.File(ctx.filesDir, "saved_music_cache.json")
+            if (!file.exists()) return null
+            val arr = org.json.JSONArray(file.readText())
+            val list = mutableListOf<MusicMessage>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val fileId = obj.getLong("fileId")
+                val rawMsgId = obj.getLong("messageId")
+                val messageId = if (rawMsgId != fileId && rawMsgId > 0L) rawMsgId else 0L
+                var filename = obj.getString("filename")
+                var serverTitle = if (obj.has("serverTitle") && !obj.isNull("serverTitle")) obj.getString("serverTitle") else null
+                var serverArtist = if (obj.has("serverArtist") && !obj.isNull("serverArtist")) obj.getString("serverArtist") else null
+                
+                val localTitle = LocalMetadataManager.getTitle(ctx, fileId)
+                val localArtist = LocalMetadataManager.getArtist(ctx, fileId)
+                if (serverTitle.isNullOrBlank() && !localTitle.isNullOrBlank()) serverTitle = localTitle
+                if (serverArtist.isNullOrBlank() && !localArtist.isNullOrBlank()) serverArtist = localArtist
+
+                if (filename.startsWith("Track ") || filename.startsWith("Cached Track") || filename == "Unknown file") {
+                    if (!serverTitle.isNullOrBlank()) {
+                        filename = if (!serverArtist.isNullOrBlank()) "$serverArtist - $serverTitle.mp3" else "$serverTitle.mp3"
+                    }
+                }
+
+                list.add(MusicMessage(
+                    messageId,
+                    fileId,
+                    filename,
+                    obj.optString("fileUrl", ""),
+                    obj.optInt("chatId", 0),
+                    serverTitle,
+                    serverArtist
+                ))
+            }
+            list
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
     suspend fun getSavedMusic(retryCount: Int = 1): List<MusicMessage> {
+        if (cachedMusicList == null) {
+            val diskList = loadMusicListCache()
+            if (!diskList.isNullOrEmpty()) {
+                cachedMusicList = diskList.toMutableList()
+                ru.alexeyrf.maxmusic.Logger.log("[Network] Loaded ${diskList.size} tracks from disk cache")
+            }
+        }
         if (authToken == null) {
             val localDir = java.io.File(context?.filesDir, "local_tracks")
             if (!localDir.exists()) localDir.mkdirs()
             val files = localDir.listFiles() ?: emptyArray()
             val list = mutableListOf<MusicMessage>()
+            val ctx = context
             for (file in files) {
-                val fileId = file.name.hashCode().toLong()
-                val messageId = file.lastModified()
-                list.add(MusicMessage(messageId, fileId, file.name, file.absolutePath, 0, null, null))
+                val fileId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                val rawMod = file.lastModified()
+                val messageId = if (rawMod > 0L) rawMod else fileId
+                val localTitle = if (ctx != null) LocalMetadataManager.getTitle(ctx, fileId) else null
+                val localArtist = if (ctx != null) LocalMetadataManager.getArtist(ctx, fileId) else null
+                list.add(MusicMessage(messageId, fileId, file.name, "file://" + file.absolutePath, 0, localTitle, localArtist))
             }
-            return list.sortedByDescending { it.messageId }
+            return list.distinctBy { it.fileId }.sortedByDescending { it.messageId }
         }
         try {
             if (!isConnected()) {
-                resumeSession()
+                ru.alexeyrf.maxmusic.Logger.log("[Network] Client not connected, resuming session...")
+                val ok = resumeSession()
+                if (!ok) throw Exception("Failed to resume session")
             }
             
             val allMessages = mutableListOf<MusicMessage>()
-            val knownIds = cachedMusicList?.map { it.messageId }?.toSet() ?: emptySet()
+            val hasCorruptedCached = cachedMusicList?.any { isCorruptedTrack(it) } ?: false
+            val validKnownIds = if (!hasCorruptedCached) {
+                cachedMusicList?.filter { !isCorruptedTrack(it) }?.map { it.messageId }?.toSet() ?: emptySet()
+            } else {
+                emptySet()
+            }
+            
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Fetching music history (hasCorruptedCached=$hasCorruptedCached, knownIdsCount=${validKnownIds.size})...")
+            
             var currentFrom = System.currentTimeMillis()
             var reachedKnown = false
             var apiCalls = 0
+            val maxCalls = if (hasCorruptedCached) 30 else 15
             
-            while (!reachedKnown && apiCalls < 50) { // max 5000 messages history
+            while (!reachedKnown && apiCalls < maxCalls) {
                 apiCalls++
+                ru.alexeyrf.maxmusic.Logger.log("[Network] Fetching CHAT_HISTORY page $apiCalls (from=$currentFrom)...")
                 val res = sendRequest(0, 49, mapOf(
                     "chatId" to 0,
                     "backward" to 100,
                     "from" to currentFrom,
                     "itemType" to "REGULAR",
                     "getMessages" to true,
-                    "interactive" to false
-                ), timeoutMs = 15000L) // reduced timeout to fail faster on dead sockets
+                    "interactive" to true
+                ), timeoutMs = 15000L)
                 
                 val msgsList = res["messages"] as? List<*> ?: break
                 if (msgsList.isEmpty()) {
                     isHistoryFullyLoaded = true
+                    ru.alexeyrf.maxmusic.Logger.log("[Network] History reached beginning (empty messages)")
                     break
                 }
                 
@@ -460,7 +650,7 @@ class MaxClient(
                     if (msgTime < minTime) minTime = msgTime
                     fetchedCount++
                     
-                    if (msgId in knownIds) {
+                    if (validKnownIds.isNotEmpty() && msgId in validKnownIds) {
                         reachedKnown = true
                         continue
                     }
@@ -468,85 +658,177 @@ class MaxClient(
                     val attaches = msg["attaches"] as? List<*> ?: continue
                     for (attachObj in attaches) {
                         val attach = attachObj as? Map<*, *> ?: continue
-                        val fileId = (attach["fileId"] as? Number)?.toLong()
+                        
+                        val fileId = (attach["fileId"] ?: attach["file_id"] ?: attach["id"] 
+                            ?: (attach["file"] as? Map<*, *>)?.get("id") 
+                            ?: (attach["file"] as? Map<*, *>)?.get("fileId")
+                            ?: (attach["audio"] as? Map<*, *>)?.get("id")
+                            ?: (attach["audio"] as? Map<*, *>)?.get("fileId"))?.toString()?.toLongOrNull() ?: continue
 
+                        val attachType = (attach["_type"] ?: attach["type"])?.toString()?.uppercase()
+                        val audioMap = attach["audio"] as? Map<*, *>
+                        val preview = attach["preview"] as? Map<*, *>
+                        
                         var filename = attach["filename"] as? String
                             ?: attach["fileName"] as? String
                             ?: attach["name"] as? String
-                            ?: attach["title"] as? String
                             ?: (attach["file"] as? Map<*, *>)?.get("name") as? String
                             ?: (attach["file"] as? Map<*, *>)?.get("filename") as? String
-                            ?: "Unknown file"
+                            ?: audioMap?.get("name") as? String
+                            ?: audioMap?.get("title") as? String
+                            ?: attach["title"] as? String
+                            ?: ""
                             
-                        filename = fixEncoding(filename) ?: "Unknown file"
+                        filename = fixEncoding(filename) ?: ""
+
+                        val serverTitle = fixEncoding(
+                            preview?.get("title") as? String 
+                            ?: audioMap?.get("title") as? String 
+                            ?: attach["title"] as? String
+                            ?: preview?.get("name") as? String
+                        )
+                        val serverArtist = fixEncoding(
+                            preview?.get("artist") as? String 
+                            ?: audioMap?.get("artist") as? String 
+                            ?: attach["artist"] as? String 
+                            ?: preview?.get("performer") as? String
+                            ?: audioMap?.get("performer") as? String
+                            ?: preview?.get("author") as? String
+                        )
 
                         val ext = filename.substringAfterLast('.', "").lowercase()
-
-                        val preview = attach["preview"] as? Map<*, *>
-                        val serverTitle = fixEncoding(preview?.get("title") as? String)
-                        val serverArtist = fixEncoding(preview?.get("artist") as? String)
-
-                        if (fileId != null && (ext in listOf("mp3", "flac", "wav", "zmusic", "z2", "mp4", "mkv", "avi", "webm", "mov") || filename.contains(".zconfig"))) {
+                        val isAudioExt = ext in listOf("mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma", "zmusic", "z2", "mp4", "mkv", "avi", "webm", "mov")
+                        val isAudioAttach = attachType in listOf("AUDIO", "VOICE", "MUSIC") || audioMap != null || serverTitle != null || filename.contains(".zconfig")
+                        
+                        if (isAudioExt || isAudioAttach) {
+                            if (filename.isBlank() || !filename.contains('.')) {
+                                filename = when {
+                                    !serverTitle.isNullOrBlank() && !serverArtist.isNullOrBlank() -> "$serverArtist - $serverTitle.mp3"
+                                    !serverTitle.isNullOrBlank() -> "$serverTitle.mp3"
+                                    else -> "track_$fileId.mp3"
+                                }
+                            }
                             allMessages.add(MusicMessage(msgId, fileId, filename, "", 0, serverTitle, serverArtist))
                         }
                     }
                 }
                 
-                if (reachedKnown) break
+                if (reachedKnown) {
+                    ru.alexeyrf.maxmusic.Logger.log("[Network] Reached known messages boundary")
+                    break
+                }
                 if (fetchedCount < 100) {
                     isHistoryFullyLoaded = true
+                    ru.alexeyrf.maxmusic.Logger.log("[Network] History page fetched < 100 items ($fetchedCount), finished")
                     break
                 }
                 currentFrom = minTime
             }
             
-            val combined = (allMessages + (cachedMusicList ?: emptyList()))
-                .distinctBy { it.messageId }
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Fetched ${allMessages.size} tracks from server history")
+            
+            val serverMap = allMessages.associateBy { it.fileId }
+            val updatedCached = (cachedMusicList ?: emptyList()).map { cachedTrack ->
+                serverMap[cachedTrack.fileId] ?: cachedTrack
+            }
+            val ctx = context
+            val localTracks = if (ctx != null) {
+                val localDir = java.io.File(ctx.filesDir, "local_tracks")
+                val files = if (localDir.exists()) localDir.listFiles() ?: emptyArray() else emptyArray()
+                files.map { file ->
+                    val fileId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                    val rawMod = file.lastModified()
+                    val messageId = if (rawMod > 0L) rawMod else fileId
+                    val localTitle = LocalMetadataManager.getTitle(ctx, fileId)
+                    val localArtist = LocalMetadataManager.getArtist(ctx, fileId)
+                    MusicMessage(messageId, fileId, file.name, "file://" + file.absolutePath, 0, localTitle, localArtist)
+                }
+            } else emptyList()
+
+            val combined = (allMessages + updatedCached + localTracks)
+                .distinctBy { it.fileId }
                 .sortedByDescending { it.messageId }
             
             cachedMusicList = combined.toMutableList()
+            saveMusicListCache(combined)
+            for (track in combined) {
+                ru.alexeyrf.maxmusic.AudioCacheManager.registerTrack(track.fileId, track.messageId, track.filename, track.serverTitle, track.serverArtist)
+            }
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Total music list: ${combined.size} tracks")
             return cachedMusicList!!
         } catch (e: Exception) {
-            Log.e(tag, "Failed to getSavedMusic, retryCount=$retryCount", e)
-            if (retryCount > 0) {
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Failed to getSavedMusic: ${e.message}, retryCount=$retryCount")
+            if (retryCount > 0 && e.message?.contains("too.many.requests") != true) {
                 disconnect()
                 return getSavedMusic(retryCount - 1)
             }
-            // If all retries fail, return cached tracks
-            return cachedMusicList ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks()
+            return cachedMusicList ?: loadMusicListCache() ?: ru.alexeyrf.maxmusic.AudioCacheManager.getCachedTracks(context)
         }
     }
-    
+
     suspend fun getFileDownloadUrl(messageId: Long, fileId: Long): String? {
-        if (authToken == null) {
-            val localDir = java.io.File(context?.filesDir, "local_tracks")
+        val localDir = java.io.File(context?.filesDir, "local_tracks")
+        if (localDir.exists()) {
             val files = localDir.listFiles() ?: emptyArray()
             for (file in files) {
-                if (file.name.hashCode().toLong() == fileId) {
+                val fId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                if (fId == fileId || file.name.hashCode().toLong() == fileId) {
                     return "file://" + file.absolutePath
                 }
             }
+        }
+        if (authToken == null) {
             return null
         }
         return try {
             if (!isConnected()) {
                 resumeSession()
             }
+            var effectiveMsgId = messageId
+            if (effectiveMsgId <= 0L || effectiveMsgId == fileId) {
+                val found = findValidMessageId(fileId)
+                if (found != null && found > 0L) {
+                    effectiveMsgId = found
+                    ru.alexeyrf.maxmusic.Logger.log("[Network] Resolved messageId $effectiveMsgId for fileId $fileId")
+                }
+            }
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Requesting download URL for fileId=$fileId, messageId=$effectiveMsgId (opcode 88)...")
             // FILE_DOWNLOAD = 88
             val res = sendRequest(0, 88, mapOf(
                 "chatId" to 0,
-                "messageId" to messageId,
+                "messageId" to effectiveMsgId,
                 "fileId" to fileId
-            ), timeoutMs = 10000L)
-            res["url"] as? String
+            ), timeoutMs = 12000L)
+            val url = res["url"] as? String
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Got download URL for fileId=$fileId: ${if (url != null) "SUCCESS" else "NULL"}")
+            url
         } catch (e: Exception) {
-            Log.e(tag, "getFileDownloadUrl failed", e)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] getFileDownloadUrl failed for fileId=$fileId: ${e.message}")
             null
         }
     }
 
     suspend fun deleteTrack(msgId: Long): Boolean = withContext(Dispatchers.IO) {
-        if (!isConnected()) return@withContext false
+        ru.alexeyrf.maxmusic.Logger.log("[Network] Deleting track msgId=$msgId...")
+        val localDir = java.io.File(context?.filesDir, "local_tracks")
+        if (localDir.exists()) {
+            val files = localDir.listFiles() ?: emptyArray()
+            for (file in files) {
+                val fId = file.name.hashCode().toLong().let { if (it == 0L) 1L else it }
+                if (fId == msgId || file.name.hashCode().toLong() == msgId || file.lastModified() == msgId) {
+                    file.delete()
+                    cachedMusicList?.removeAll { it.messageId == msgId || it.fileId == msgId || it.fileId == fId }
+                    cachedMusicList?.let { saveMusicListCache(it) }
+                    return@withContext true
+                }
+            }
+        }
+        if (authToken == null) {
+            return@withContext false
+        }
+        if (!isConnected()) {
+            resumeSession()
+        }
         try {
             // MSG_DELETE = 66
             val payload = mapOf(
@@ -556,14 +838,25 @@ class MaxClient(
             )
             sendRequest(0, 66, payload, timeoutMs = 10000L)
             cachedMusicList?.removeAll { it.messageId == msgId }
+            cachedMusicList?.let { saveMusicListCache(it) }
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Deleted track msgId=$msgId successfully")
             true
         } catch (e: Exception) {
-            Log.e(tag, "Failed to delete track", e)
+            ru.alexeyrf.maxmusic.Logger.log("[Network] Failed to delete track msgId=$msgId: ${e.message}")
             false
         }
     }
 
     suspend fun sendMusic(fileName: String, fileBytes: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        if (authToken == null) {
+            val ctx = context ?: return@withContext false
+            val localDir = java.io.File(ctx.filesDir, "local_tracks")
+            if (!localDir.exists()) localDir.mkdirs()
+            val localFile = java.io.File(localDir, fileName)
+            localFile.writeBytes(fileBytes)
+            ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Saved local track to ${localFile.absolutePath}")
+            return@withContext true
+        }
         try {
             ru.alexeyrf.maxmusic.Logger.log(">>> [sendMusic] Started upload for fileName='$fileName', size=${fileBytes.size} bytes")
             // FILE_UPLOAD = 87
@@ -654,8 +947,15 @@ class MaxClient(
     }
 
     fun disconnect() {
+        disconnectInternal()
+    }
+
+    private fun disconnectInternal() {
+        val pendingCount = pendingRequests.size
+        ru.alexeyrf.maxmusic.Logger.log("[Network] Disconnecting socket (cancelling $pendingCount pending requests)")
         try {
             pingJob?.cancel()
+            pingJob = null
             socket?.close()
         } catch (e: Exception) {
             // ignore
@@ -663,11 +963,18 @@ class MaxClient(
             socket = null
             input = null
             output = null
+            isAuthenticated = false
+            
+            val pending = pendingRequests.values.toList()
+            pendingRequests.clear()
+            for (deferred in pending) {
+                deferred.completeExceptionally(java.io.IOException("Socket disconnected"))
+            }
         }
     }
 
     fun isConnected(): Boolean {
-        return socket != null && socket?.isClosed == false
+        return socket != null && socket?.isClosed == false && isAuthenticated
     }
 
     // ==========================================

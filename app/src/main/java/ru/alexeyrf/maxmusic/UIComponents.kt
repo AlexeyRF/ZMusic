@@ -11,9 +11,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.filled.Close
 
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.material3.*
@@ -96,11 +99,17 @@ enum class AuthStep {
     Loading, Phone, Code, Password
 }
 
+fun MusicMessage.isStreamLink(): Boolean =
+    filename.endsWith(".rutube.zconfig") || filename.endsWith(".youtube.zconfig")
+
+fun MusicMessage.isBackupConfig(): Boolean =
+    filename.contains(".zconfig") && !isStreamLink()
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MusicListScreen(
     modifier: Modifier = Modifier, 
-    maxClient: MaxClient,
+    maxClient: MaxClient, 
     onFileSelected: (Uri) -> Unit,
     onShowSettings: () -> Unit,
     onGoToAuth: () -> Unit = {}
@@ -116,6 +125,10 @@ fun MusicListScreen(
     var isRutubeSearching by remember { mutableStateOf(false) }
     var selectedRutubeVideo by remember { mutableStateOf<RutubeExtractor.RutubeVideo?>(null) }
     var showRutubeOptionsDialog by remember { mutableStateOf(false) }
+    var youtubeResults by remember { mutableStateOf<List<YouTubeExtractor.YouTubeVideo>>(emptyList()) }
+    var isYouTubeSearching by remember { mutableStateOf(false) }
+    var selectedYouTubeVideo by remember { mutableStateOf<YouTubeExtractor.YouTubeVideo?>(null) }
+    var showYouTubeOptionsDialog by remember { mutableStateOf(false) }
     var showMaxAuthPrompt by remember { mutableStateOf(false) }
 
     if (showRutubeOptionsDialog && selectedRutubeVideo != null) {
@@ -159,12 +172,37 @@ fun MusicListScreen(
                                 json.put("title", video.title)
                                 json.put("author", video.author)
                                 json.put("thumbnail", video.thumbnailUrl)
-                                val bytes = json.toString().toByteArray(Charsets.UTF_8)
+                                val jsonBytes = json.toString().toByteArray(Charsets.UTF_8)
+                                val processedBytes = if (CryptoManager.isPasswordSet) {
+                                    try {
+                                        CryptoManager.encryptBytes(context, jsonBytes)
+                                    } catch (e: Exception) {
+                                        jsonBytes
+                                    }
+                                } else {
+                                    jsonBytes
+                                }
                                 val filename = "${video.title.replace(Regex("[^a-zA-Zа-яА-Я0-9]"), "_")}.rutube.zconfig"
-                                val success = maxClient.sendMusic(filename, bytes)
+                                val success = maxClient.sendMusic(filename, processedBytes)
                                 if (success) {
                                     kotlinx.coroutines.delay(1000)
-                                    musicList = maxClient.getSavedMusic().filter { ((!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                                    val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
+                                    val newTrack = newList.find { it.filename == filename }
+                                    if (newTrack != null) {
+                                        LocalMetadataManager.saveTitle(context, newTrack.fileId, video.title)
+                                        LocalMetadataManager.saveArtist(context, newTrack.fileId, video.author)
+                                        if (video.thumbnailUrl.isNotEmpty()) {
+                                            try {
+                                                val thumbBytes = withContext(Dispatchers.IO) { java.net.URL(video.thumbnailUrl).readBytes() }
+                                                val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                                if (bmp != null) {
+                                                    LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
+                                                }
+                                            } catch (e: Exception) {}
+                                        }
+                                    }
+                                    musicList = newList
+                                    ConfigManager.saveLocalConfig(context)
                                 }
                             } catch (e: Exception) {}
                             isLoading = false
@@ -179,12 +217,43 @@ fun MusicListScreen(
                                 val tempFile = java.io.File(context.cacheDir, "rutube_temp.ts")
                                 val success = RutubeExtractor.downloadVideo(video.id, tempFile) { }
                                 if (success) {
-                                    val bytes = tempFile.readBytes()
-                                    val filename = "${video.author} - ${video.title}.ts".replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                                    val upSuccess = maxClient.sendMusic(filename, bytes)
+                                    val rawBytes = tempFile.readBytes()
+                                    var processedBytes = rawBytes
+                                    val uuid = java.util.UUID.randomUUID().toString()
+                                    val finalFileName = if (CryptoManager.isPasswordSet) {
+                                        try {
+                                            processedBytes = CryptoManager.encryptBytes(context, rawBytes)
+                                            "encrypted_${uuid}.z2"
+                                        } catch (e: Exception) {
+                                            "${video.author} - ${video.title}.ts".replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                        }
+                                    } else {
+                                        "${video.author} - ${video.title}.ts".replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                    }
+                                    val upSuccess = maxClient.sendMusic(finalFileName, processedBytes)
                                     if (upSuccess) {
                                         kotlinx.coroutines.delay(1000)
-                                        musicList = maxClient.getSavedMusic().filter { ((!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                                        val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
+                                        val newTrack = newList.find { it.filename == finalFileName }
+                                        if (newTrack != null) {
+                                            val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
+                                            cacheFile.writeBytes(rawBytes) // Cache decrypted audio
+                                            AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, video.title, video.author)
+                                            
+                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, video.title)
+                                            LocalMetadataManager.saveArtist(context, newTrack.fileId, video.author)
+                                            if (video.thumbnailUrl.isNotEmpty()) {
+                                                try {
+                                                    val thumbBytes = withContext(Dispatchers.IO) { java.net.URL(video.thumbnailUrl).readBytes() }
+                                                    val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                                    if (bmp != null) {
+                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
+                                                    }
+                                                } catch (e: Exception) {}
+                                            }
+                                        }
+                                        musicList = newList
+                                        ConfigManager.saveLocalConfig(context)
                                     }
                                 }
                                 tempFile.delete()
@@ -195,6 +264,166 @@ fun MusicListScreen(
                 }
             },
             confirmButton = { TextButton(onClick = { showRutubeOptionsDialog = false }) { Text("Отмена") } }
+        )
+    }
+
+    if (showYouTubeOptionsDialog && selectedYouTubeVideo != null) {
+        val video = selectedYouTubeVideo!!
+        AlertDialog(
+            onDismissRequest = { showYouTubeOptionsDialog = false },
+            title = { Text(video.title) },
+            text = {
+                Column {
+                    Text("Выберите действие:")
+                    Spacer(Modifier.height(16.dp))
+                    Button(onClick = {
+                        showYouTubeOptionsDialog = false
+                        coroutineScope.launch {
+                            isLoading = true
+                            try {
+                                val tempFile = java.io.File(context.cacheDir, "youtube_temp_${System.currentTimeMillis()}.m4a")
+                                val success = YouTubeExtractor.downloadAudio(context, video.id, tempFile) { }
+                                if (success && tempFile.exists() && tempFile.length() > 0L) {
+                                    val rawBytes = tempFile.readBytes()
+                                    val cleanTitle = video.title.trim().ifEmpty { "YouTube Track" }
+                                    val cleanAuthor = video.author.trim()
+                                    val safeBaseName = "${if (cleanAuthor.isNotEmpty()) "$cleanAuthor - " else ""}$cleanTitle"
+                                        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                                    val fileName = "$safeBaseName.m4a"
+
+                                    val fileId = (video.id.hashCode().toLong() and 0x7FFFFFFFFFFFFFFFL).let { if (it <= 0L) System.currentTimeMillis() else it }
+                                    val messageId = System.currentTimeMillis()
+
+                                    val localDir = java.io.File(context.filesDir, "local_tracks")
+                                    if (!localDir.exists()) localDir.mkdirs()
+                                    val localFile = java.io.File(localDir, fileName)
+                                    localFile.writeBytes(rawBytes)
+
+                                    val cacheFile = java.io.File(context.cacheDir, "track_${fileId}.audio")
+                                    cacheFile.writeBytes(rawBytes)
+
+                                    LocalMetadataManager.saveTitle(context, fileId, cleanTitle)
+                                    if (cleanAuthor.isNotEmpty()) {
+                                        LocalMetadataManager.saveArtist(context, fileId, cleanAuthor)
+                                    }
+                                    if (video.thumbnailUrl.isNotEmpty()) {
+                                        try {
+                                            val thumbBytes = withContext(Dispatchers.IO) {
+                                                val proxy = ProxyManager.getProxy(context)
+                                                java.net.URL(video.thumbnailUrl).openConnection(proxy).getInputStream().readBytes()
+                                            }
+                                            val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                            if (bmp != null) {
+                                                LocalMetadataManager.saveCover(context, fileId, bmp)
+                                            }
+                                        } catch (e: Exception) {}
+                                    }
+
+                                    AudioCacheManager.registerTrack(fileId, messageId, fileName, cleanTitle, cleanAuthor)
+
+                                    val localMsg = MusicMessage(
+                                        messageId = messageId,
+                                        fileId = fileId,
+                                        filename = fileName,
+                                        fileUrl = "file://" + localFile.absolutePath,
+                                        chatId = 0,
+                                        serverTitle = cleanTitle,
+                                        serverArtist = cleanAuthor
+                                    )
+                                    maxClient.addLocalTrack(localMsg)
+
+                                    musicList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
+                                    ConfigManager.saveLocalConfig(context)
+                                    android.widget.Toast.makeText(context, "Трек '$cleanTitle' сохранен в кэш!", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    android.widget.Toast.makeText(context, "Не удалось скачать аудио с YouTube", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                                tempFile.delete()
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                android.widget.Toast.makeText(context, "Ошибка при сохранении трека: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                            isLoading = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Скачать в кэш") }
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = {
+                        showYouTubeOptionsDialog = false
+                        if (maxClient.authToken == null) {
+                            showMaxAuthPrompt = true
+                            return@Button
+                        }
+                        coroutineScope.launch {
+                            isLoading = true
+                            try {
+                                val tempFile = java.io.File(context.cacheDir, "youtube_temp_${System.currentTimeMillis()}.m4a")
+                                val success = YouTubeExtractor.downloadAudio(context, video.id, tempFile) { }
+                                if (success && tempFile.exists() && tempFile.length() > 0L) {
+                                    val rawBytes = tempFile.readBytes()
+                                    var processedBytes = rawBytes
+                                    val uuid = java.util.UUID.randomUUID().toString()
+                                    val cleanTitle = video.title.trim().ifEmpty { "YouTube Track" }
+                                    val cleanAuthor = video.author.trim()
+                                    val safeBaseName = "${if (cleanAuthor.isNotEmpty()) "$cleanAuthor - " else ""}$cleanTitle"
+                                        .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+
+                                    val finalFileName = if (CryptoManager.isPasswordSet) {
+                                        try {
+                                            processedBytes = CryptoManager.encryptBytes(context, rawBytes)
+                                            "encrypted_${uuid}.z2"
+                                        } catch (e: Exception) {
+                                            "$safeBaseName.m4a"
+                                        }
+                                    } else {
+                                        "$safeBaseName.m4a"
+                                    }
+                                    val upSuccess = maxClient.sendMusic(finalFileName, processedBytes)
+                                    if (upSuccess) {
+                                        kotlinx.coroutines.delay(1000)
+                                        val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
+                                        val newTrack = newList.find { it.filename == finalFileName }
+                                        if (newTrack != null) {
+                                            val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
+                                            cacheFile.writeBytes(rawBytes) // Cache decrypted audio
+                                            AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, cleanTitle, cleanAuthor)
+                                            
+                                            LocalMetadataManager.saveTitle(context, newTrack.fileId, cleanTitle)
+                                            if (cleanAuthor.isNotEmpty()) {
+                                                LocalMetadataManager.saveArtist(context, newTrack.fileId, cleanAuthor)
+                                            }
+                                            if (video.thumbnailUrl.isNotEmpty()) {
+                                                try {
+                                                    val thumbBytes = withContext(Dispatchers.IO) {
+                                                        val proxy = ProxyManager.getProxy(context)
+                                                        java.net.URL(video.thumbnailUrl).openConnection(proxy).getInputStream().readBytes()
+                                                    }
+                                                    val bmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+                                                    if (bmp != null) {
+                                                        LocalMetadataManager.saveCover(context, newTrack.fileId, bmp)
+                                                    }
+                                                } catch (e: Exception) {}
+                                            }
+                                        }
+                                        musicList = newList
+                                        ConfigManager.saveLocalConfig(context)
+                                        android.widget.Toast.makeText(context, "Трек '$cleanTitle' сохранен в библиотеку!", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        android.widget.Toast.makeText(context, "Не удалось загрузить трек в библиотеку", android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                } else {
+                                    android.widget.Toast.makeText(context, "Не удалось скачать аудио с YouTube", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                                tempFile.delete()
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                android.widget.Toast.makeText(context, "Ошибка при сохранении трека: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                            isLoading = false
+                        }
+                    }, modifier = Modifier.fillMaxWidth()) { Text("Скачать в библиотеку") }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showYouTubeOptionsDialog = false }) { Text("Отмена") } }
         )
     }
 
@@ -363,7 +592,7 @@ fun MusicListScreen(
                     kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                         val msg = if (skippedCount > 0) "Загружено: $uploadedCount, пропущено дубликатов: $skippedCount" else "Загружено треков: $uploadedCount"
                         android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_SHORT).show()
-                        musicList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                        musicList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
                         
                         if (useZ2) {
                             for (track in musicList) {
@@ -562,11 +791,12 @@ fun MusicListScreen(
                         if (success) {
                             Logger.log("Успешно загружен трек: $finalFileName")
                             kotlinx.coroutines.delay(1500)
-                            val newList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+                            val newList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
                             val newTrack = newList.find { it.filename == finalFileName }
                             if (newTrack != null) {
                                 val cacheFile = java.io.File(context.cacheDir, "track_${newTrack.fileId}.audio")
                                 cacheFile.writeBytes(unencryptedBytes)
+                                AudioCacheManager.registerTrack(newTrack.fileId, newTrack.messageId, newTrack.filename, newTrack.serverTitle, newTrack.serverArtist)
                                 
                                 if (useZ2) {
                                     val titleToSave = if (newTitle.isNotBlank()) newTitle else rawName
@@ -601,34 +831,44 @@ fun MusicListScreen(
             permissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         }
         try {
-            musicList = maxClient.getSavedMusic().filter { (!(it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) || it.filename.endsWith(".rutube.zconfig")) }
+            musicList = maxClient.getSavedMusic().filter { !it.isBackupConfig() }
             
             val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
             if (!prefs.getBoolean("config_auto_loaded", false)) {
-                val configTracks = maxClient.getSavedMusic().filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }
-                if (configTracks.isNotEmpty()) {
-                    val latestGroup = configTracks.groupBy { it.filename.substringBefore(".part") }.maxByOrNull { it.key }
-                    if (latestGroup != null) {
-                        try {
-                            coroutineScope.launch(Dispatchers.IO) {
-                                withContext(Dispatchers.Main) { android.widget.Toast.makeText(context, "Автозагрузка настроек...", android.widget.Toast.LENGTH_SHORT).show() }
-                                val providers = latestGroup.value.sortedBy { it.filename }.map { partTrack ->
-                                    val url = maxClient.getFileDownloadUrl(partTrack.messageId, partTrack.fileId)
-                                    val provider: () -> java.io.InputStream? = { java.net.URL(url).openStream() as java.io.InputStream? }
-                                    provider
+                if (maxClient.authToken != null) {
+                    val configTracks = maxClient.getSavedMusic().filter { it.isBackupConfig() }
+                    if (configTracks.isNotEmpty()) {
+                        val latestGroup = configTracks.groupBy { it.filename.substringBefore(".part") }.maxByOrNull { it.key }
+                        if (latestGroup != null) {
+                            try {
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    withContext(Dispatchers.Main) { android.widget.Toast.makeText(context, "Автозагрузка настроек с сервера...", android.widget.Toast.LENGTH_SHORT).show() }
+                                    val providers = latestGroup.value.sortedBy { it.filename }.map { partTrack ->
+                                        val url = maxClient.getFileDownloadUrl(partTrack.messageId, partTrack.fileId)
+                                        val provider: () -> java.io.InputStream? = { java.net.URL(url).openStream() as java.io.InputStream? }
+                                        provider
+                                    }
+                                    val success = ConfigManager.importConfig(context, providers)
+                                    if (success) {
+                                        prefs.edit().putBoolean("config_auto_loaded", true).apply()
+                                        withContext(Dispatchers.Main) { android.widget.Toast.makeText(context, "Настройки восстановлены! Пожалуйста, перезапустите приложение.", android.widget.Toast.LENGTH_LONG).show() }
+                                    }
                                 }
-                                val success = ConfigManager.importConfig(context, providers)
-                                if (success) {
-                                    prefs.edit().putBoolean("config_auto_loaded", true).apply()
-                                    withContext(Dispatchers.Main) { android.widget.Toast.makeText(context, "Настройки восстановлены! Пожалуйста, перезапустите приложение.", android.widget.Toast.LENGTH_LONG).show() }
-                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
                             }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
+                        }
+                    }
+                    prefs.edit().putBoolean("config_auto_loaded", true).apply()
+                } else {
+                    val localCfg = ConfigManager.getLocalConfigFile(context)
+                    if (localCfg.exists() && localCfg.length() > 0) {
+                        coroutineScope.launch(Dispatchers.IO) {
+                            ConfigManager.importLocalConfig(context)
+                            prefs.edit().putBoolean("config_auto_loaded", true).apply()
                         }
                     }
                 }
-                prefs.edit().putBoolean("config_auto_loaded", true).apply()
             }
             
             coroutineScope.launch {
@@ -644,7 +884,12 @@ fun MusicListScreen(
                                 val overrideArtist = LocalMetadataManager.getArtist(context, track.fileId)
                                 val overrideCover = LocalMetadataManager.getCover(context, track.fileId)
                                 
-                                val defaultTitle = track.serverTitle ?: track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
+                                val rawClean = when {
+                                    track.filename.endsWith(".rutube.zconfig") -> track.filename.removeSuffix(".rutube.zconfig").replace('_', ' ')
+                                    track.filename.endsWith(".youtube.zconfig") -> track.filename.removeSuffix(".youtube.zconfig").replace('_', ' ')
+                                    else -> track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
+                                }
+                                val defaultTitle = track.serverTitle ?: rawClean
                                 val title = overrideTitle ?: meta.title ?: defaultTitle
                                 val artist = overrideArtist ?: meta.artist ?: track.serverArtist
                                 val albumArt = overrideCover ?: meta.albumArt
@@ -1019,12 +1264,24 @@ fun MusicListScreen(
                         title = {
                             OutlinedTextField(
                                 value = searchQuery,
-                                onValueChange = { searchQuery = it; rutubeResults = emptyList() },
+                                onValueChange = { 
+                                    searchQuery = it
+                                    rutubeResults = emptyList()
+                                    isRutubeSearching = false
+                                    youtubeResults = emptyList()
+                                    isYouTubeSearching = false
+                                },
                                 placeholder = { Text("Поиск треков...") },
                                 singleLine = true,
                                 trailingIcon = {
                                     if (searchQuery.isNotEmpty()) {
-                                        IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Filled.Clear, contentDescription = "Очистить") }
+                                        IconButton(onClick = { 
+                                            searchQuery = ""
+                                            rutubeResults = emptyList()
+                                            isRutubeSearching = false
+                                            youtubeResults = emptyList()
+                                            isYouTubeSearching = false
+                                        }) { Icon(Icons.Filled.Clear, contentDescription = "Очистить") }
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth().padding(end = 8.dp)
@@ -1035,6 +1292,10 @@ fun MusicListScreen(
                             IconButton(onClick = { 
                                 isSearchActive = false
                                 searchQuery = ""
+                                rutubeResults = emptyList()
+                                isRutubeSearching = false
+                                youtubeResults = emptyList()
+                                isYouTubeSearching = false
                             }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад") }
                         }
                     )
@@ -1066,13 +1327,17 @@ fun MusicListScreen(
         floatingActionButton = {
             Column(horizontalAlignment = Alignment.End) {
                 SmallFloatingActionButton(
-                    onClick = { folderPickerLauncher.launch(null) },
+                    onClick = { 
+                        if (maxClient.authToken == null) showMaxAuthPrompt = true 
+                        else folderPickerLauncher.launch(null) 
+                    },
                     modifier = Modifier.padding(bottom = 8.dp)
                 ) {
                     Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = "Add Folder")
                 }
                 FloatingActionButton(onClick = {
-                    filePickerLauncher.launch("*/*")
+                    if (maxClient.authToken == null) showMaxAuthPrompt = true 
+                    else filePickerLauncher.launch("*/*")
                 }) {
                     Icon(Icons.Filled.Add, contentDescription = "Add")
                 }
@@ -1369,7 +1634,10 @@ fun MusicListScreen(
         ) {
             Box(modifier = Modifier.weight(1f)) {
                 val baseDisplayList = if (AudioPlayer.isCachedOnly.value) {
-                    musicList.filter { java.io.File(context.cacheDir, "track_${it.fileId}.audio").exists() }
+                    musicList.filter { 
+                        java.io.File(context.cacheDir, "track_${it.fileId}.audio").exists() || 
+                        (it.fileUrl.startsWith("file://") && java.io.File(it.fileUrl.removePrefix("file://")).exists())
+                    }
                 } else {
                     musicList
                 }
@@ -1391,86 +1659,168 @@ fun MusicListScreen(
                     }
                 }
                 
-                if (displayList.isEmpty()) {
+                val uniqueDisplayList = remember(displayList) {
+                    displayList.distinctBy { track ->
+                        val keyPart = if (track.messageId != 0L) track.messageId else track.fileId
+                        "${keyPart}_${track.fileId}_${track.filename}"
+                    }
+                }
+                
+                if (uniqueDisplayList.isEmpty() && (!isSearchActive || searchQuery.isBlank())) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text(if (AudioPlayer.isCachedOnly.value) "Нет закешированных аудио" else "Нет аудио")
                     }
                 } else {
                     LazyColumn(modifier = Modifier.fillMaxSize()) {
-                        items(displayList, key = { it.messageId }) { track ->
-                            MusicItem(
-                                track = track,
-                                selectionMode = isSelectionMode,
-                                isSelected = selectedTracks.contains(track.fileId),
-                                onClick = {
-                                    if (isSelectionMode) {
-                                        val mSet = selectedTracks.toMutableSet()
-                                        if (mSet.contains(track.fileId)) mSet.remove(track.fileId) else mSet.add(track.fileId)
-                                        selectedTracks = mSet
-                                    } else {
-                                        AudioPlayer.setPlaylist(context, maxClient, displayList, displayList.indexOf(track))
-                                        AudioPlayer.playCurrentTrack()
-                                    }
-                                },
-                                onLongClick = {
-                                    if (!isSelectionMode) {
-                                        isSelectionMode = true
-                                        selectedTracks = setOf(track.fileId)
-                                    }
-                                },
-                                onDelete = {
-                                    coroutineScope.launch {
-                                        val oldList = musicList
-                                        musicList = musicList.filter { it.messageId != track.messageId }
-                                        val success = maxClient.deleteTrack(track.messageId)
-                                        if (success) {
-                                            val cacheFile = java.io.File(context.cacheDir, "track_${track.fileId}.audio")
-                                            if (cacheFile.exists()) cacheFile.delete()
-                                        } else {
-                                            musicList = oldList
-                                            android.widget.Toast.makeText(context, "Ошибка при удалении", android.widget.Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
+                        if (uniqueDisplayList.isEmpty() && isSearchActive && searchQuery.isNotBlank()) {
+                            item(key = "empty_library_notice") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 32.dp, bottom = 16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        "В вашей медиатеке ничего не найдено", 
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
-                            )
-                        }
-                        if (searchQuery.isNotBlank() && displayList.size < 10 && !isRutubeSearching) {
-                            item {
-                                TextButton(
-                                    onClick = { 
-                                        isRutubeSearching = true
-                                        coroutineScope.launch {
-                                            rutubeResults = RutubeExtractor.search(searchQuery)
-                                            isRutubeSearching = false
+                            }
+                        } else {
+                            items(uniqueDisplayList, key = { track ->
+                                val keyPart = if (track.messageId != 0L) track.messageId else track.fileId
+                                "track_${keyPart}_${track.fileId}_${track.filename}"
+                            }) { track ->
+                                MusicItem(
+                                    track = track,
+                                    selectionMode = isSelectionMode,
+                                    isSelected = selectedTracks.contains(track.fileId),
+                                    onClick = {
+                                        if (isSelectionMode) {
+                                            val mSet = selectedTracks.toMutableSet()
+                                            if (mSet.contains(track.fileId)) mSet.remove(track.fileId) else mSet.add(track.fileId)
+                                            selectedTracks = mSet
+                                        } else {
+                                            AudioPlayer.selectTrack(context, maxClient, uniqueDisplayList, uniqueDisplayList.indexOf(track))
                                         }
                                     },
-                                    modifier = Modifier.fillMaxWidth().padding(16.dp)
-                                ) {
-                                    Text("Не нашли нужное? Искать на Rutube")
-                                }
-                            }
-                        }
-                        if (isRutubeSearching) {
-                            item {
-                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
-                                    CircularProgressIndicator()
-                                }
-                            }
-                        }
-                        if (rutubeResults.isNotEmpty()) {
-                            item {
-                                Text("Результаты Rutube", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
-                            }
-                            items(rutubeResults, key = { it.id }) { video ->
-                                ListItem(
-                                    headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                                    supportingContent = { Text(video.author) },
-                                    modifier = Modifier.clickable {
-                                        selectedRutubeVideo = video
-                                        showRutubeOptionsDialog = true
+                                    onLongClick = {
+                                        if (!isSelectionMode) {
+                                            isSelectionMode = true
+                                            selectedTracks = setOf(track.fileId)
+                                        }
+                                    },
+                                     onDelete = {
+                                        coroutineScope.launch {
+                                            val oldList = musicList
+                                            musicList = musicList.filter { 
+                                                (track.messageId != 0L && it.messageId != track.messageId) || 
+                                                (track.messageId == 0L && it.fileId != track.fileId)
+                                            }
+                                            val targetId = if (track.messageId != 0L) track.messageId else track.fileId
+                                            val success = maxClient.deleteTrack(targetId)
+                                            if (success) {
+                                                val cacheFile = java.io.File(context.cacheDir, "track_${track.fileId}.audio")
+                                                if (cacheFile.exists()) cacheFile.delete()
+                                                if (track.fileUrl.startsWith("file://")) {
+                                                    val localF = java.io.File(track.fileUrl.removePrefix("file://"))
+                                                    if (localF.exists()) localF.delete()
+                                                }
+                                            } else {
+                                                musicList = oldList
+                                                android.widget.Toast.makeText(context, "Ошибка при удалении", android.widget.Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
                                     }
                                 )
-                                HorizontalDivider()
+                            }
+                        }
+                        if (isSearchActive && searchQuery.isNotBlank()) {
+                            if (uniqueDisplayList.size < 10 && !isRutubeSearching && rutubeResults.isEmpty()) {
+                                item(key = "rutube_search_btn") {
+                                    TextButton(
+                                        onClick = { 
+                                            isRutubeSearching = true
+                                            coroutineScope.launch {
+                                                rutubeResults = RutubeExtractor.search(searchQuery)
+                                                isRutubeSearching = false
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Не нашли нужное? Искать на Rutube")
+                                    }
+                                }
+                            }
+                            if (uniqueDisplayList.size < 10 && !isYouTubeSearching && youtubeResults.isEmpty()) {
+                                item(key = "youtube_search_btn") {
+                                    TextButton(
+                                        onClick = { 
+                                            isYouTubeSearching = true
+                                            coroutineScope.launch {
+                                                youtubeResults = YouTubeExtractor.search(context, searchQuery)
+                                                isYouTubeSearching = false
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Искать на YouTube")
+                                    }
+                                }
+                            }
+                            if (isRutubeSearching) {
+                                item(key = "rutube_loading") {
+                                    Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                        CircularProgressIndicator()
+                                    }
+                                }
+                            }
+                            if (rutubeResults.isNotEmpty()) {
+                                val uniqueRutubeResults = rutubeResults.distinctBy { it.id }
+                                item(key = "rutube_header") {
+                                    Text("Результаты Rutube", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+                                }
+                                items(uniqueRutubeResults, key = { "rutube_${it.id}" }) { video ->
+                                    ListItem(
+                                        headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        supportingContent = { Text(video.author) },
+                                        modifier = Modifier.clickable {
+                                            selectedRutubeVideo = video
+                                            showRutubeOptionsDialog = true
+                                        }
+                                    )
+                                    HorizontalDivider()
+                                }
+                            }
+                            if (isYouTubeSearching) {
+                                item(key = "youtube_loading") {
+                                    Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                        CircularProgressIndicator()
+                                    }
+                                }
+                            }
+                            if (youtubeResults.isNotEmpty()) {
+                                val uniqueYouTubeResults = youtubeResults.distinctBy { it.id }
+                                item(key = "youtube_header") {
+                                    Text("Результаты YouTube", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+                                }
+                                items(uniqueYouTubeResults, key = { "youtube_${it.id}" }) { video ->
+                                    ListItem(
+                                        headlineContent = { Text(video.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                        supportingContent = { 
+                                            val desc = if (video.author.isNotBlank() && video.duration.isNotBlank()) {
+                                                "${video.author} • ${video.duration}"
+                                            } else if (video.author.isNotBlank()) video.author else video.duration
+                                            Text(desc) 
+                                        },
+                                        modifier = Modifier.clickable {
+                                            selectedYouTubeVideo = video
+                                            showYouTubeOptionsDialog = true
+                                        }
+                                    )
+                                    HorizontalDivider()
+                                }
                             }
                         }
                     }
@@ -1512,12 +1862,25 @@ fun MusicItem(
 ) {
     val context = LocalContext.current
     val cached = MusicItemCache.cache[track.fileId]
-    val title = cached?.title ?: (track.serverTitle ?: track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' '))
-    val artist = cached?.artist ?: track.serverArtist
-    val albumArt = cached?.albumArt
+    val localTitle = LocalMetadataManager.getTitle(context, track.fileId)
+    val localArtist = LocalMetadataManager.getArtist(context, track.fileId)
+    val rawCleanTitle = when {
+        track.filename.endsWith(".rutube.zconfig") -> track.filename.removeSuffix(".rutube.zconfig").replace('_', ' ')
+        track.filename.endsWith(".youtube.zconfig") -> track.filename.removeSuffix(".youtube.zconfig").replace('_', ' ')
+        else -> track.filename.removePrefix("encrypted_").removeSuffix(".zmusic").removeSuffix(".z2").substringBeforeLast('.').replace('+', ' ')
+    }
+    val cleanTitle = if (rawCleanTitle.startsWith("Cached Track") || rawCleanTitle.startsWith("Track ")) {
+        localTitle ?: rawCleanTitle
+    } else {
+        rawCleanTitle
+    }
+    val defaultTitle = track.serverTitle ?: localTitle ?: cleanTitle
+    val title = cached?.title ?: defaultTitle
+    val artist = cached?.artist ?: (localArtist ?: track.serverArtist)
+    val albumArt = cached?.albumArt ?: LocalMetadataManager.getCover(context, track.fileId)
     
     LaunchedEffect(track.fileId) {
-        if (cached == null) {
+        if (cached == null || cached.title.startsWith("Cached Track") || cached.title.startsWith("Track ")) {
             withContext(Dispatchers.IO) {
                 val file = AudioCacheManager.getTrackFile(context, track.fileId)
                 var tempTitle = title
@@ -1525,11 +1888,25 @@ fun MusicItem(
                 var tempArt = albumArt
                 
                 if (file != null) {
-                    val ext = track.filename.substringAfterLast('.', "mp3")
-                    val meta = AudioPlayer.extractTrackMetadata(file.absolutePath, ext)
-                    if (meta.title != null) tempTitle = meta.title
-                    if (meta.artist != null) tempArtist = meta.artist
-                    if (meta.albumArt != null) tempArt = meta.albumArt
+                    if (track.filename.endsWith(".rutube.zconfig") || track.filename.endsWith(".youtube.zconfig")) {
+                        try {
+                            val raw = file.readBytes()
+                            val text = if (CryptoManager.isPasswordSet) {
+                                try { String(CryptoManager.decryptBytes(context, raw), Charsets.UTF_8) } catch (e: Exception) { String(raw, Charsets.UTF_8) }
+                            } else String(raw, Charsets.UTF_8)
+                            val json = org.json.JSONObject(text)
+                            val jTitle = json.optString("title")
+                            val jAuthor = json.optString("author")
+                            if (jTitle.isNotEmpty()) tempTitle = jTitle
+                            if (jAuthor.isNotEmpty()) tempArtist = jAuthor
+                        } catch (e: Exception) {}
+                    } else {
+                        val ext = track.filename.substringAfterLast('.', "mp3")
+                        val meta = AudioPlayer.extractTrackMetadata(file.absolutePath, ext)
+                        if (meta.title != null) tempTitle = meta.title
+                        if (meta.artist != null) tempArtist = meta.artist
+                        if (meta.albumArt != null) tempArt = meta.albumArt
+                    }
                 }
                 
                 val overrideTitle = LocalMetadataManager.getTitle(context, track.fileId)
@@ -1565,6 +1942,127 @@ fun MusicItem(
                     LocalMetadataManager.saveArtist(context, track.fileId, newArtist)
                     LocalMetadataManager.saveCover(context, track.fileId, newCover)
                     LocalMetadataManager.savePlaylists(context, track.fileId, newPlaylists)
+                }
+            }
+        )
+    }
+
+    var showPropertiesDialog by remember { mutableStateOf(false) }
+    if (showPropertiesDialog) {
+        val cacheEntry = AudioCacheManager.getEntry(track.fileId)
+        val cacheFile = File(context.cacheDir, "track_${track.fileId}.audio")
+        val localDir = File(context.filesDir, "local_tracks")
+        val localFile = File(localDir, track.filename)
+        val urlFile = if (track.fileUrl.startsWith("file://")) File(track.fileUrl.removePrefix("file://")) 
+                      else if (track.fileUrl.isNotBlank() && File(track.fileUrl).exists()) File(track.fileUrl)
+                      else null
+        val playlists = LocalMetadataManager.getPlaylists(context, track.fileId)
+
+        val detailsReport = buildString {
+            appendLine("=== ОСНОВНЫЕ ДАННЫЕ ===")
+            appendLine("fileId: ${track.fileId}")
+            appendLine("messageId: ${track.messageId}")
+            appendLine("filename: ${track.filename}")
+            appendLine("fileUrl: ${track.fileUrl.ifBlank { "<пусто>" }}")
+            appendLine("chatId: ${track.chatId}")
+            appendLine("serverTitle: ${track.serverTitle ?: "<null>"}")
+            appendLine("serverArtist: ${track.serverArtist ?: "<null>"}")
+            appendLine()
+            appendLine("=== ОТОБРАЖЕНИЕ В ИНТЕРФЕЙСЕ ===")
+            appendLine("title (в UI): $title")
+            appendLine("artist (в UI): ${artist ?: "<null>"}")
+            appendLine("defaultTitle: $defaultTitle")
+            appendLine("cleanTitle: $cleanTitle")
+            appendLine("cachedMeta: title='${cached?.title}', artist='${cached?.artist}'")
+            appendLine()
+            appendLine("=== LOCAL METADATA MANAGER ===")
+            appendLine("localTitle: ${localTitle ?: "<null>"}")
+            appendLine("localArtist: ${localArtist ?: "<null>"}")
+            appendLine("hasCover: ${LocalMetadataManager.getCover(context, track.fileId) != null}")
+            appendLine("playlists: ${if (playlists.isEmpty()) "<нет>" else playlists.joinToString(", ")}")
+            appendLine()
+            appendLine("=== AUDIO CACHE MANAGER ===")
+            if (cacheEntry != null) {
+                appendLine("В cacheMeta: ДА")
+                appendLine("entry.messageId: ${cacheEntry.messageId}")
+                appendLine("entry.filename: ${cacheEntry.filename}")
+                appendLine("entry.title: ${cacheEntry.title ?: "<null>"}")
+                appendLine("entry.artist: ${cacheEntry.artist ?: "<null>"}")
+                appendLine("entry.accessCount: ${cacheEntry.accessCount}")
+                appendLine("entry.lastAccessTime: ${cacheEntry.lastAccessTime} (${java.util.Date(cacheEntry.lastAccessTime)})")
+            } else {
+                appendLine("В cacheMeta: НЕТ")
+            }
+            appendLine()
+            appendLine("=== ФАЙЛОВАЯ СИСТЕМА ===")
+            appendLine("1) cacheDir/track_${track.fileId}.audio:")
+            appendLine("   - существует: ${cacheFile.exists()}")
+            if (cacheFile.exists()) {
+                appendLine("   - размер: ${cacheFile.length()} байт (${cacheFile.length() / 1024} КБ)")
+                appendLine("   - путь: ${cacheFile.absolutePath}")
+            }
+            appendLine("2) filesDir/local_tracks/${track.filename}:")
+            appendLine("   - существует: ${localFile.exists()}")
+            if (localFile.exists()) {
+                appendLine("   - размер: ${localFile.length()} байт (${localFile.length() / 1024} КБ)")
+                appendLine("   - путь: ${localFile.absolutePath}")
+            }
+            if (urlFile != null) {
+                appendLine("3) track.fileUrl на диске:")
+                appendLine("   - существует: ${urlFile.exists()}")
+                if (urlFile.exists()) {
+                    appendLine("   - размер: ${urlFile.length()} байт (${urlFile.length() / 1024} КБ)")
+                    appendLine("   - путь: ${urlFile.absolutePath}")
+                }
+            }
+            val testFile = if (cacheFile.exists()) cacheFile else if (localFile.exists()) localFile else urlFile
+            if (testFile != null && testFile.exists()) {
+                appendLine()
+                appendLine("=== ТЕГИ ФАЙЛА (${testFile.name}) ===")
+                try {
+                    val ext = testFile.name.substringAfterLast('.', "mp3")
+                    val meta = AudioPlayer.extractTrackMetadata(testFile.absolutePath, ext)
+                    appendLine("tag.title: ${meta.title ?: "<не найден>"}")
+                    appendLine("tag.artist: ${meta.artist ?: "<не найден>"}")
+                    appendLine("tag.hasAlbumArt: ${meta.albumArt != null}")
+                } catch (e: Exception) {
+                    appendLine("Ошибка чтения тегов: ${e.message}")
+                }
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { showPropertiesDialog = false },
+            title = { Text("Свойства трека (Debug)") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = detailsReport,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    val clip = android.content.ClipData.newPlainText("Track Debug Info", detailsReport)
+                    clipboard.setPrimaryClip(clip)
+                    android.widget.Toast.makeText(context, "Скопировано в буфер обмена", android.widget.Toast.LENGTH_SHORT).show()
+                }) {
+                    Text("Скопировать")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPropertiesDialog = false }) {
+                    Text("Закрыть")
                 }
             }
         )
@@ -1655,6 +2153,14 @@ fun MusicItem(
                     }
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                         DropdownMenuItem(
+                            text = { Text("Свойства трека (Debug)") },
+                            leadingIcon = { Icon(Icons.Filled.Info, contentDescription = null) },
+                            onClick = { 
+                                showMenu = false
+                                showPropertiesDialog = true 
+                            }
+                        )
+                        DropdownMenuItem(
                             text = { Text("Редактировать метаданные") },
                             leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },
                             onClick = { 
@@ -1679,7 +2185,12 @@ fun MusicItem(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: () -> Unit) {
+fun SettingsScreen(
+    modifier: Modifier = Modifier, 
+    maxClient: MaxClient, 
+    onBack: () -> Unit,
+    onGoToAuth: () -> Unit = {}
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     var serverConfigs by remember { mutableStateOf<List<ru.alexeyrf.maxmusic.client.MusicMessage>>(emptyList()) }
@@ -1687,6 +2198,11 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
     var showLogs by remember { mutableStateOf(false) }
     var showResetConfirm by remember { mutableStateOf(false) }
     var showRestartPrompt by remember { mutableStateOf(false) }
+    var showServerAuthPrompt by remember { mutableStateOf(false) }
+    
+    val localConfigFile = remember { ConfigManager.getLocalConfigFile(context) }
+    var localConfigExists by remember { mutableStateOf(localConfigFile.exists()) }
+    var localConfigSize by remember { mutableStateOf(if (localConfigFile.exists()) localConfigFile.length() else 0L) }
     
     val configExportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
         if (uri != null) {
@@ -1729,7 +2245,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
     LaunchedEffect(Unit) {
         try {
             val allTracks = maxClient.getSavedMusic()
-            serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
+            serverConfigs = allTracks.filter { it.isBackupConfig() }.sortedByDescending { it.filename }
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
@@ -1764,6 +2280,23 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
             text = { Text("Настройки успешно загружены!\nПожалуйста, полностью закройте приложение (выгрузите из памяти) и откройте его заново для применения новых параметров.") },
             confirmButton = {
                 TextButton(onClick = { showRestartPrompt = false }) { Text("Понятно") }
+            }
+        )
+    }
+
+    if (showServerAuthPrompt) {
+        AlertDialog(
+            onDismissRequest = { showServerAuthPrompt = false },
+            title = { Text("Требуется вход в MAX") },
+            text = { Text("Похоже вы хотите выгрузить свой zconfig на сервер. Войдите через национальный мессенджер макс, чтобы ваши настройки сохранялись в облаке.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showServerAuthPrompt = false
+                    onGoToAuth()
+                }) { Text("Войти") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showServerAuthPrompt = false }) { Text("Отмена") }
             }
         )
     }
@@ -1867,27 +2400,301 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
                     )
                 }
 
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                
+                Text("Переходы между треками", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                
+                var currentTransitionMode by remember { mutableStateOf(AudioPlayer.transitionMode.value) }
+                var currentTransitionDur by remember { mutableStateOf(AudioPlayer.transitionDurationSec.value) }
+                
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    AudioPlayer.TransitionMode.values().forEach { mode ->
+                        val isSelected = currentTransitionMode == mode
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else androidx.compose.ui.graphics.Color.Transparent,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    currentTransitionMode = mode
+                                    AudioPlayer.setTransitionMode(context, mode)
+                                }
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 8.dp, horizontal = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = isSelected,
+                                    onClick = {
+                                        currentTransitionMode = mode
+                                        AudioPlayer.setTransitionMode(context, mode)
+                                    }
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = mode.title,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = if (isSelected) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal
+                                    )
+                                    Text(
+                                        text = mode.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (currentTransitionMode != AudioPlayer.TransitionMode.NORMAL) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Длительность перехода: ${currentTransitionDur} сек",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Slider(
+                        value = currentTransitionDur.toFloat(),
+                        onValueChange = {
+                            val sec = it.toInt()
+                            currentTransitionDur = sec
+                            AudioPlayer.setTransitionDuration(context, sec)
+                        },
+                        valueRange = 1f..10f,
+                        steps = 8
+                    )
+                    Text(
+                        text = if (currentTransitionMode == AudioPlayer.TransitionMode.CRISPY) {
+                            "При криспи-переходе уходящий трек мягко затухает по динамической кривой, а новый трек плавно выходит вперед без нагромождения частот и перегрузки баса."
+                        } else {
+                            "Текущий трек плавно затихает до нуля, после чего следующий трек начинает воспроизведение с нарастающей громкостью."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    var manualTransition by remember { mutableStateOf(AudioPlayer.manualTransitionEnabled.value) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                "При ручном переключении",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            Text(
+                                "Применять плавный переход при переключении кнопками или выборе трека во время воспроизведения",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = manualTransition,
+                            onCheckedChange = {
+                                manualTransition = it
+                                AudioPlayer.setManualTransitionEnabled(context, it)
+                            }
+                        )
+                    }
+                }
 
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                
+                Text("Поддержка YouTube", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                
+                var proxyEnabled by remember { mutableStateOf(ProxyManager.isProxyEnabled(context)) }
+                var proxyHost by remember { mutableStateOf(ProxyManager.getProxyHost(context)) }
+                var proxyPortStr by remember { mutableStateOf(ProxyManager.getProxyPort(context).let { if (it > 0) it.toString() else "1080" }) }
+                var proxyUser by remember { mutableStateOf(ProxyManager.getProxyUser(context)) }
+                var proxyPass by remember { mutableStateOf(ProxyManager.getProxyPass(context)) }
+                
+                var isTestingProxy by remember { mutableStateOf(false) }
+                var proxyTestResult by remember { mutableStateOf<String?>(null) }
+                var proxyTestSuccess by remember { mutableStateOf<Boolean?>(null) }
+                
+                val saveProxy = {
+                    val port = proxyPortStr.toIntOrNull() ?: 1080
+                    ProxyManager.setProxyConfig(context, proxyEnabled, proxyHost, port, proxyUser, proxyPass)
+                }
+                
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("SOCKS-прокси", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Использовать SOCKS прокси для доступа к YouTube",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = proxyEnabled,
+                        onCheckedChange = {
+                            proxyEnabled = it
+                            saveProxy()
+                        }
+                    )
+                }
+                
+                if (proxyEnabled) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = proxyHost,
+                            onValueChange = {
+                                proxyHost = it
+                                saveProxy()
+                            },
+                            label = { Text("Хост / IP") },
+                            placeholder = { Text("127.0.0.1") },
+                            singleLine = true,
+                            modifier = Modifier.weight(2f)
+                        )
+                        OutlinedTextField(
+                            value = proxyPortStr,
+                            onValueChange = {
+                                proxyPortStr = it
+                                saveProxy()
+                            },
+                            label = { Text("Порт") },
+                            placeholder = { Text("1080") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = proxyUser,
+                            onValueChange = {
+                                proxyUser = it
+                                saveProxy()
+                            },
+                            label = { Text("Логин (опционально)") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = proxyPass,
+                            onValueChange = {
+                                proxyPass = it
+                                saveProxy()
+                            },
+                            label = { Text("Пароль (опционально)") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                saveProxy()
+                                isTestingProxy = true
+                                proxyTestResult = null
+                                coroutineScope.launch {
+                                    val (success, message) = ProxyManager.testConnection(context)
+                                    isTestingProxy = false
+                                    proxyTestSuccess = success
+                                    proxyTestResult = message
+                                }
+                            },
+                            enabled = !isTestingProxy
+                        ) {
+                            if (isTestingProxy) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Проверка...")
+                            } else {
+                                Text("Проверить подключение")
+                            }
+                        }
+                    }
+                    if (proxyTestResult != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = proxyTestResult!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (proxyTestSuccess == true) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
                 
                 Text("Экспорт / Импорт настроек (.zconfig)", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(vertical = 8.dp))
                 
+                Text(
+                    text = if (localConfigExists) "Локальный zconfig: сохранен (${localConfigSize / 1024} КБ)" else "Локальный zconfig: еще не сохранен",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        coroutineScope.launch {
+                            val saved = ConfigManager.saveLocalConfig(context)
+                            if (saved != null) {
+                                localConfigExists = true
+                                localConfigSize = saved.length()
+                                android.widget.Toast.makeText(context, "Конфиг сохранен локально!", android.widget.Toast.LENGTH_SHORT).show()
+                            } else {
+                                android.widget.Toast.makeText(context, "Ошибка сохранения", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }, modifier = Modifier.weight(1f)) {
+                        Text("Сохранить локально", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    if (localConfigExists) {
+                        OutlinedButton(onClick = {
+                            coroutineScope.launch {
+                                val ok = ConfigManager.importLocalConfig(context)
+                                if (ok) {
+                                    showRestartPrompt = true
+                                } else {
+                                    android.widget.Toast.makeText(context, "Ошибка импорта", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }, modifier = Modifier.weight(1f)) {
+                            Text("Восстановить", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
-                        coroutineScope.launch {
-                            android.widget.Toast.makeText(context, "Создание конфига...", android.widget.Toast.LENGTH_SHORT).show()
-                            val parts = ConfigManager.exportConfig(context)
-                            android.widget.Toast.makeText(context, "Создано ${parts.size} частей. Выгрузка...", android.widget.Toast.LENGTH_SHORT).show()
-                            var allOk = true
-                            parts.forEach { part ->
-                                val res = ConfigManager.uploadConfig(context, maxClient, part)
-                                if (!res) allOk = false
-                            }
-                            if (allOk) {
-                                android.widget.Toast.makeText(context, "Успешно выгружено!", android.widget.Toast.LENGTH_LONG).show()
-                                val allTracks = maxClient.getSavedMusic()
-                                serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
-                            } else {
-                                android.widget.Toast.makeText(context, "Ошибка выгрузки", android.widget.Toast.LENGTH_LONG).show()
+                        if (maxClient.authToken == null) {
+                            showServerAuthPrompt = true
+                        } else {
+                            coroutineScope.launch {
+                                android.widget.Toast.makeText(context, "Создание общего конфига...", android.widget.Toast.LENGTH_SHORT).show()
+                                val parts = ConfigManager.exportConfig(context)
+                                android.widget.Toast.makeText(context, "Создано ${parts.size} частей. Выгрузка...", android.widget.Toast.LENGTH_SHORT).show()
+                                var allOk = true
+                                parts.forEach { part ->
+                                    val res = ConfigManager.uploadConfig(context, maxClient, part)
+                                    if (!res) allOk = false
+                                }
+                                if (allOk) {
+                                    android.widget.Toast.makeText(context, "Успешно выгружено на сервер!", android.widget.Toast.LENGTH_LONG).show()
+                                    val allTracks = maxClient.getSavedMusic()
+                                    serverConfigs = allTracks.filter { it.isBackupConfig() }.sortedByDescending { it.filename }
+                                } else {
+                                    android.widget.Toast.makeText(context, "Ошибка выгрузки", android.widget.Toast.LENGTH_LONG).show()
+                                }
                             }
                         }
                     }, modifier = Modifier.weight(1f)) {
@@ -1945,7 +2752,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, maxClient: MaxClient, onBack: 
                                                 maxClient.deleteTrack(partTrack.messageId)
                                             }
                                             val allTracks = maxClient.getSavedMusic()
-                                            serverConfigs = allTracks.filter { (it.filename.contains(".zconfig") && !it.filename.endsWith(".rutube.zconfig")) }.sortedByDescending { it.filename }
+                                            serverConfigs = allTracks.filter { it.isBackupConfig() }.sortedByDescending { it.filename }
                                         }
                                     }) {
                                         Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)

@@ -100,7 +100,17 @@ fun getEncryptedMaxmusicPrefs(context: Context): android.content.SharedPreferenc
 object Logger {
     val logs = mutableStateListOf<String>()
     fun log(msg: String) {
-        logs.add(0, msg)
+        val time = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault()).format(java.util.Date())
+        val formatted = "[$time] $msg"
+        android.util.Log.d("ZMusic", formatted)
+        try {
+            if (logs.size > 500) {
+                logs.removeAt(logs.size - 1)
+            }
+            logs.add(0, formatted)
+        } catch (e: Exception) {
+            // ignore concurrent modifications
+        }
     }
 }
 object MaxClientProvider {
@@ -123,6 +133,7 @@ class MainActivity : ComponentActivity() {
         maxClient.context = this
         AudioCacheManager.init(this)
         VibeManager.init(this)
+        AudioPlayer.initSettings(this)
         enableEdgeToEdge()
         setContent {
             val prefs = getSharedPreferences("settings", Context.MODE_PRIVATE)
@@ -167,7 +178,11 @@ class MainActivity : ComponentActivity() {
                             SettingsScreen(
                                 modifier = Modifier,
                                 maxClient = maxClient,
-                                onBack = { currentScreen = Screen.MusicList }
+                                onBack = { currentScreen = Screen.MusicList },
+                                onGoToAuth = {
+                                    isStartupAuth = false
+                                    currentScreen = Screen.Auth
+                                }
                             )
                         }
                     }

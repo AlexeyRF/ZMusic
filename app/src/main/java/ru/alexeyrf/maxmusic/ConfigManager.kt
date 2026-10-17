@@ -27,7 +27,7 @@ object ConfigManager {
                 val prefsDir = File(context.applicationInfo.dataDir, "shared_prefs")
                 if (prefsDir.exists()) {
                     prefsDir.listFiles()?.forEach { file ->
-                        if (file.isFile && file.name != "crypto_prefs.xml") { // Skip crypto prefs to avoid leaking encryption key
+                        if (file.isFile && file.name != "crypto_prefs.xml" && file.name != "session_prefs.xml") { // Skip crypto and session prefs
                             zos.putNextEntry(ZipEntry("shared_prefs/${file.name}"))
                             file.inputStream().use { it.copyTo(zos) }
                             zos.closeEntry()
@@ -92,6 +92,37 @@ object ConfigManager {
             return@withContext parts
         } finally {
             if (tempZip.exists()) tempZip.delete()
+        }
+    }
+
+    fun getLocalConfigFile(context: Context): File {
+        return File(context.filesDir, "current_config.zconfig")
+    }
+
+    // Saves current settings to a local encrypted zconfig file
+    suspend fun saveLocalConfig(context: Context): File? = withContext(Dispatchers.IO) {
+        try {
+            val parts = exportConfig(context)
+            if (parts.isNotEmpty()) {
+                val localTarget = getLocalConfigFile(context)
+                parts[0].copyTo(localTarget, overwrite = true)
+                return@withContext localTarget
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        null
+    }
+
+    // Loads settings from the local encrypted zconfig file if it exists
+    suspend fun importLocalConfig(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val localTarget = getLocalConfigFile(context)
+        if (!localTarget.exists()) return@withContext false
+        try {
+            return@withContext importConfig(context, listOf { localTarget.inputStream() })
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return@withContext false
         }
     }
     
