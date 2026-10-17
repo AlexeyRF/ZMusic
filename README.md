@@ -18,5 +18,5 @@ ZMusic - это музыкальный плеер для Android. Оно поз�
 - **И всё это бесплатно, без лимитов, за 2 мегабайта памяти, рекламы и цензуры.**
 
 ## Авторы и титры
-Автор [API Max](https://github.com/MaxApiTeam/PyMax) на Python (Pymax), часть библиотеки переведена мной на kotlin
+Автор [API Max](https://github.com/MaxApiTeam/PyMax) на Python (Pymax), часть библиотеки переведена мной на kotlin<br>
 Автор [Rutube и Youtube API](https://github.com/yt-dlp/yt-dlp) на Python (ytdlp), переведено мной на Kotlin
